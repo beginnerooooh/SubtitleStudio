@@ -48,7 +48,7 @@ def fake_fw(monkeypatch):
                 raise state["error_configs"][key]
             if key in state["oom_configs"]:
                 raise RuntimeError("CUDA out of memory")
-            segments = [
+            segments = state.get("segments") or [
                 _FakeSegment([_FakeWord(" 你", 0.0, 0.4), _FakeWord("好。", 0.4, 0.9)], 0.9),
                 _FakeSegment([_FakeWord("世界", 1.2, 2.0)], 2.0),
             ]
@@ -177,3 +177,56 @@ class TestModelCache:
         # 第二次调用：float16 已被逐出缓存，会重新构造（并再次 OOM 降档）
         t.transcribe("b.wav")
         assert fake_fw["constructed"].count(("small", "cuda", "float16")) == 2
+
+
+class TestWordSpacing:
+    """whisper 前导空格 → 前词尾随空格（拉丁词间）；CJK 侧不补。"""
+
+    def _t(self):
+        return Transcriber(model_size="small", device="cpu", compute_type="int8")
+
+    def test_english_words_get_spaces(self, fake_fw):
+        fake_fw["segments"] = [
+            _FakeSegment(
+                [_FakeWord("And", 0.0, 0.4), _FakeWord(" so,", 0.4, 0.8),
+                 _FakeWord(" my", 0.8, 1.2)],
+                1.2,
+            ),
+        ]
+        lines = self._t().transcribe("a.wav")
+        assert [ln.text for ln in lines] == ["And so, my"]
+        assert [w.text for w in lines[0].words] == ["And ", "so, ", "my"]
+
+    def test_space_bridges_across_segments(self, fake_fw):
+        fake_fw["segments"] = [
+            _FakeSegment([_FakeWord("fellow", 0.0, 0.5)], 0.5),
+            _FakeSegment([_FakeWord(" Americans", 0.6, 1.0)], 1.0),
+        ]
+        lines = self._t().transcribe("a.wav")
+        assert [ln.text for ln in lines] == ["fellow ", "Americans"]
+        # 跨段空格挂到前一段末词；聚合后拼接正确
+        assert lines[0].words[-1].text == "fellow "
+
+    def test_first_word_leading_space_dropped(self, fake_fw):
+        fake_fw["segments"] = [
+            _FakeSegment([_FakeWord(" hello", 0.0, 0.4), _FakeWord(" world", 0.4, 0.8)], 0.8),
+        ]
+        lines = self._t().transcribe("a.wav")
+        # 首词自身的前导空格被丢弃（不产生 " hello"）；
+        # 第二词的前导空格按约定挂到首词末尾
+        assert [w.text for w in lines[0].words] == ["hello ", "world"]
+
+    def test_cjk_words_no_space_inserted(self, fake_fw):
+        fake_fw["segments"] = [
+            _FakeSegment([_FakeWord("你", 0.0, 0.4), _FakeWord(" 好", 0.4, 0.8)], 0.8),
+        ]
+        lines = self._t().transcribe("a.wav")
+        assert [ln.text for ln in lines] == ["你好"]
+        assert [w.text for w in lines[0].words] == ["你", "好"]
+
+    def test_cjk_latin_boundary_no_space(self, fake_fw):
+        fake_fw["segments"] = [
+            _FakeSegment([_FakeWord("中文", 0.0, 0.4), _FakeWord(" AI", 0.4, 0.8)], 0.8),
+        ]
+        lines = self._t().transcribe("a.wav")
+        assert [ln.text for ln in lines] == ["中文AI"]

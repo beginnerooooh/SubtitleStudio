@@ -187,6 +187,17 @@ def _choose_candidate(candidates):
     return max(candidates, key=margin)[0]
 
 
+def _vocab_id(vocab: dict, ch: str, unk_id: int) -> int:
+    """查词表；未命中时回退大写（wav2vec2 英文模型词表仅含大写字母）。
+
+    CJK/数字等字符 upper() 后不变，不受影响。
+    """
+    cid = vocab.get(ch)
+    if cid is None:
+        cid = vocab.get(ch.upper(), unk_id)
+    return cid
+
+
 def _expand_targets(lines, vocab, sep_id, unk_id):
     """歌词 token 展平为字符 id 流：中文一字一 id，英文按字符展开。
 
@@ -204,7 +215,7 @@ def _expand_targets(lines, vocab, sep_id, unk_id):
                 char_ids.append(sep_id)
                 token_refs.append(None)
             for ch in tok.align:
-                char_ids.append(vocab.get(ch, unk_id))
+                char_ids.append(_vocab_id(vocab, ch, unk_id))
                 token_refs.append((li, ti))
             prev_multi = multi
     return token_refs, char_ids

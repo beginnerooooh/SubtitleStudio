@@ -1,11 +1,14 @@
 """盲识别：faster-whisper 封装（懒加载 + 模型缓存 + OOM 降档链 + 进度/取消）。"""
 from __future__ import annotations
 
+import re
 import threading
 from typing import Callable, Optional
 
 from core.errors import TaskCancelled
 from core.models import SubtitleLine, SubtitleWord
+
+_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 
 
 class TranscriptionError(RuntimeError):
@@ -48,6 +51,13 @@ def reset_model_cache() -> None:
 
 def _is_oom(exc: BaseException) -> bool:
     return "out of memory" in str(exc).lower()
+
+
+def _bridge_space(prev_text: str, cur_text: str) -> bool:
+    """拉丁词间需要补空格；任一侧边缘为汉字时不补（避免中文夹杂空格）。"""
+    if not prev_text or not cur_text:
+        return False
+    return not _CJK_RE.match(prev_text[-1]) and not _CJK_RE.match(cur_text[0])
 
 
 class Transcriber:
@@ -107,19 +117,30 @@ class Transcriber:
         return chain
 
     def _collect(self, segments, total_duration: Optional[float]) -> list[SubtitleLine]:
-        """逐段消费 segments：检查取消、聚合成行、按已处理时长报进度。"""
+        """逐段消费 segments：检查取消、聚合成行、按已处理时长报进度。
+
+        whisper 词 token 的词间空白（前导空格）转移到前一个词的显示末尾，
+        与对齐模式 display 约定一致；CJK 一侧为汉字时不补空格。
+        """
         lines: list[SubtitleLine] = []
+        prev_end = 0.0
+        last_word: Optional[SubtitleWord] = None
         for seg in segments:
             self._check_cancel()
             words: list[SubtitleWord] = []
-            prev_end = lines[-1].end if lines else 0.0
             for w in seg.words or []:
-                text = (w.word or "").strip()
+                raw = w.word or ""
+                text = raw.strip()
                 if not text:
                     continue
+                if raw[:1].isspace() and last_word is not None and _bridge_space(
+                    last_word.text, text
+                ):
+                    last_word.text += " "
                 start = w.start if w.start is not None else prev_end
                 end = w.end if w.end is not None else start
-                words.append(SubtitleWord(text=text, start=start, end=end))
+                last_word = SubtitleWord(text=text, start=start, end=end)
+                words.append(last_word)
                 prev_end = end
             if not words:
                 continue

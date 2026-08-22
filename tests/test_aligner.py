@@ -198,6 +198,20 @@ class TestExpandTargets:
         _, ids = _expand_targets(lines, {"你": 1}, sep_id=None, unk_id=9)
         assert ids == [9]
 
+    def test_uppercase_vocab_fallback(self):
+        """wav2vec2 英文模型词表仅含大写：小写输入应回退命中大写 id。"""
+        vocab = {"<pad>": 0, "|": 4, "H": 11, "I": 12}
+        lines = [[Token("hi", "hi")]]
+        _, ids = _expand_targets(lines, vocab, sep_id=4, unk_id=3)
+        assert ids == [11, 12]
+
+    def test_uppercase_fallback_never_replaces_exact_hit(self):
+        """词表同时含大小写时精确命中优先，不做大小写改写。"""
+        vocab = {"a": 1, "A": 2}
+        lines = [[Token("aA", "aA")]]
+        _, ids = _expand_targets(lines, vocab, sep_id=None, unk_id=9)
+        assert ids == [1, 2]
+
 
 class TestAlignGlobal:
     def test_short_audio_global_alignment(self, monkeypatch, wav_factory):
