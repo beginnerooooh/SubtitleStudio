@@ -19,6 +19,7 @@
 | GUI 框架 | Gradio | 上传/表格/进度/下载全是现成组件；用户推荐 |
 | 盲识别引擎 | faster-whisper（CTranslate2） | 4x 速度、低显存、VAD 内置、MIT |
 | 强制对齐 | 自研模块：wav2vec2 中文模型 + `torchaudio.functional.forced_align` | 依赖干净无版本冲突；中文词表即汉字，逐字精度最高；核心对齐算法是 torchaudio 官方 API |
+| 对齐区间分配 | 短音频（≤15min）全局 CTC 对齐；长音频 VAD 分块 + ±2 行重叠滑窗 | 评审反馈：副歌长音下「语速均匀」线性分配会错位 |
 | 人声分离 | Demucs（htdemucs，two_stems=vocals），可选开关 | 歌声识别前置增强 |
 | 目标硬件 | CUDA/CPU 自动检测，自动选择量化策略 | 用户确认 |
 | 内容语言 | 中文为主，英文文本自动切换对齐模型 | 用户确认 |
@@ -33,17 +34,25 @@
 ├── requirements.txt        # 依赖 + CUDA/FFmpeg/HF镜像 安装注释
 ├── core/
 │   ├── __init__.py
+│   ├── models.py           # SubtitleWord / SubtitleLine 数据模型
+│   ├── text.py             # 歌词标准化/分字分词/标点剥离回填（纯逻辑，无重依赖）
 │   ├── env.py              # 环境检测：CUDA、FFmpeg、显存 → 量化策略
 │   ├── audio.py            # FFmpeg 抽取/标准化 16kHz 16bit mono WAV
 │   ├── separator.py        # Demucs 人声分离（可选）
 │   ├── transcriber.py      # faster-whisper 盲识别
-│   ├── aligner.py          # wav2vec2 CTC 强制对齐（核心新代码）
+│   ├── aligner.py          # wav2vec2 CTC 强制对齐（全局 + 滑窗分块策略）
 │   ├── pipeline.py         # 流水线编排 + 进度回调 + 取消
 │   └── subtitle.py         # SRT / LRC / ASS 生成器（纯函数）
 └── tests/
-    ├── test_subtitle.py    # 字幕格式生成（无模型依赖）
-    ├── test_text.py        # 文本标准化/分字分词（无模型依赖）
-    └── test_pipeline_smoke.py  # 集成冒烟（标记 slow，需真实模型）
+    ├── test_text.py        # 标准化/分字分词/标点回填（纯逻辑）
+    ├── test_subtitle.py    # 字幕格式生成（纯逻辑）
+    ├── test_env.py         # 环境探测（mock）
+    ├── test_audio.py       # FFmpeg 转码（mock + ffmpeg 静音夹具）
+    ├── test_transcriber.py # 降档链/进度回调（mock）
+    ├── test_separator.py   # 失败回退/显存释放（mock）
+    ├── test_aligner.py     # 行分配/重叠去歧义/置信度（mock 前向）
+    ├── test_pipeline.py    # 编排状态机（mock 各阶段）
+    └── test_pipeline_smoke.py  # 集成冒烟（slow，需真实模型）
 ```
 
 模块边界：`pipeline.py` 只做编排不碰算法；core 各模块可独立使用；模型全部懒加载 + 进程内缓存（换文件不重载模型）。
@@ -53,7 +62,7 @@
 ```python
 @dataclass
 class SubtitleWord:
-    text: str      # 单个汉字或英文单词
+    text: str      # 显示形式：汉字/英文词 + 尾随标点（对齐用剥离形式）
     start: float   # 秒
     end: float
 
@@ -98,6 +107,7 @@ class SubtitleLine:
 - `demucs.api.Separator`，模型 `htdemucs`，`two_stems="vocals"`（只出人声干声，比四轨省一半时间）
 - 设备跟随全局策略（GPU/CPU）
 - 失败（OOM/依赖缺失）→ 警告日志 + 回退原始音频继续（不中断任务）
+- 分离完成后显式释放：`del` 模型引用 → `gc.collect()` → `torch.cuda.empty_cache()`（Demucs 峰值 2~4GB，防止与后续 faster-whisper / wav2vec2 显存争抢）
 
 ### 5.5 transcriber.py — 盲识别
 
@@ -109,15 +119,27 @@ class SubtitleLine:
 
 ### 5.6 aligner.py — 强制对齐（核心）
 
-文本标准化：
+文本预处理（`core/text.py`，纯逻辑可单测）：
 - 全半角统一（全角→半角）、剥离空行与内嵌 `[00:12.34]` 时间戳、剥离常见歌词标记行（[ti:] [ar:] 等）
-- 切分：中文按**字**、英文/数字按**词**（连续拉丁字母串为一个 token），保留原文映射（导出时还原空格与原文）
+- 切分：中文按**字**、英文/数字按**词**（连续拉丁字母串为一个 token）
+- 标点：对齐 token 不含标点（声学模型词表无标点）；每 token 记录**显示形式**（词本体 + 尾随标点），`SubtitleWord.text` 存显示形式，标点随词回填，导出 SRT/ASS 时自然还原
 
-分块对齐算法：
-1. Silero VAD 找语音区间（去静音/前奏/间奏）
-2. 歌词行按字数比例分配到各语音区间（比例假设：语速均匀）
-3. 每个区间内：wav2vec2 前向得 log_probs → `torchaudio.functional.forced_align(log_probs, targets)` → 字级帧索引 → ×0.02s（wav2vec2 stride 320 @16kHz）→ 秒级时间戳（毫秒精度，与 `SubtitleWord` 单位一致）
-4. 每区间输出对齐置信度（空白/重复 token 占比），低置信 → 日志标记「建议人工复核」
+对齐策略（按音频时长自动选择，阈值 15 分钟）：
+
+**短音频（≤ 15 分钟）— 全局对齐**（默认路径，覆盖绝大多数歌曲）：
+1. 完整人声分块过 wav2vec2：**32s 窗 / 30s 步进**，拼接时仅保留每窗中央 30s 帧（每帧 ≥1s 双侧上下文，消除分块边界伪影），log_probs 在全局时间轴拼接
+2. 完整 token 序列与全局 log_probs 执行**一次** `torchaudio.functional.forced_align(log_probs, targets)`：CTC DP 全局最优、天然单调，无累计漂移；前奏/间奏/静音由 blank 吸收
+3. token 全局帧索引 ×0.02s（stride 320 @16kHz）→ 秒级时间戳（毫秒精度）；按歌词原始行结构（`\n`）还原 `SubtitleLine`
+4. 内存特征：log_probs 落 CPU float32，15 分钟峰值约 900MB（本地工具可接受）
+
+**长音频（> 15 分钟）— VAD 分块 + 重叠滑窗行分配**（直播回放类）：
+1. Silero VAD 找语音区间，相邻区间合并为对齐块（目标 ~10 分钟语音/块，只在 VAD 区间边界切割）
+2. 歌词行按「字数 ↔ 语音时长」比例初步分配到块（仅作锚点，精度不依赖语速均匀假设）
+3. 每块行范围向前后各扩 **±2 行重叠缓冲**，块内走上述全局对齐流程
+4. 缓冲行在相邻块被对齐两次 → **保留距块边缘更远的结果**（滑窗去歧义），丢弃另一个；逐块处理即释放内存
+5. token 挤压块边缘或置信度异常 → 日志警告「该边界区域建议人工复核」
+
+置信度：全局/每块输出 blank 与重复 token 占比，低置信 → 日志标记「建议人工复核」。
 
 声学模型：
 - 中文（CJK 占比 > 30%）：`jonatasgrosman/wav2vec2-large-xlsr-53-chinese-zh-cn`（词表即汉字）
@@ -154,7 +176,8 @@ class SubtitleLine:
 - 「开始生成」→ `threading.Thread(daemon=False)` 启动 pipeline
 - Gradio 事件函数为 generator：每 0.5s 从 `queue.Queue` 拉取最新进度/日志/状态 `yield` 刷回 UI
 - 取消按钮只置位 `threading.Event`，pipeline 在分块边界检查并安全退出（模型缓存保留）
-- 单任务串行；运行中禁用开始按钮（防并发重入）
+- 进度组件遵循 Gradio 5.x 规范：`gr.Progress`（阶段进度，支持 `track_tqdm`）+ generator `yield` 增量刷新日志/预览/下载组件
+- 并发防护双保险：运行中禁用开始按钮 + `threading.Lock` 串行锁（获取失败立即返回「任务进行中」提示）
 
 ## 8. 异常处理清单
 
@@ -172,9 +195,11 @@ class SubtitleLine:
 ## 9. 测试策略
 
 - `test_subtitle.py`：SRT/LRC/ASS 纯逻辑（时间格式化、ms→厘秒换算、延音、聚合规则、原文还原）
-- `test_text.py`：标准化/分字分词/内嵌时间戳剥离/中英混合切分
+- `test_text.py`：标准化/分字分词/内嵌时间戳剥离/中英混合切分/**标点剥离与回填 round-trip**
+- `test_aligner.py`：长音频行分配 + ±2 行重叠去歧义 + 置信度（纯逻辑部分，模型前向 monkeypatch）
+- `test_env.py` / `test_audio.py` / `test_transcriber.py` / `test_separator.py` / `test_pipeline.py`：mock 依赖测控制流（降档链、回退、进度汇总、取消）
 - `test_pipeline_smoke.py`：`@pytest.mark.slow`，需真实模型 + 样例音频，本地手动
-- 手动验收：短视频（盲识别）+ 一首歌（对齐）各跑通全流程，含 LRC/ASS 输出在播放器验证
+- 手动验收：短视频（盲识别）+ 一首歌（对齐）+ 长音频（≥30min 进度/取消/显存）各跑通全流程，含 LRC/ASS 输出在播放器验证
 
 ## 10. 依赖与环境
 
