@@ -1,0 +1,37 @@
+# ============================================================
+# Subtitle Studio 依赖清单
+#
+# 【Python】>= 3.10（本项目在 3.12 验证）
+#
+# 【FFmpeg】需系统安装（用于音频抽取/转码，工具启动时会自动检测）：
+#   - Windows: https://www.gyan.dev/ffmpeg/builds/ 下载 release-full，
+#     解压后将 bin 目录（含 ffmpeg.exe / ffprobe.exe）加入系统 PATH
+#   - macOS:   brew install ffmpeg
+#   - Linux:   sudo apt install ffmpeg  /  sudo dnf install ffmpeg
+#
+# 【NVIDIA GPU 加速（可选，推荐）】
+#   1. 先安装 NVIDIA 显卡驱动：https://www.nvidia.com/drivers
+#   2. CUDA 版 PyTorch 需用官方 index-url 单独安装（覆盖本文件中的 CPU 版）：
+#        pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+#      仅 CPU 用户直接执行下方整份安装即可。
+#   3. 安装其余依赖：
+#        pip install -r requirements.txt
+#   说明：CUDA/CPU 由工具启动时自动检测；显存 >=8GB 用 float16，
+#         <8GB 用 int8_float16，CPU 用 int8。
+#
+# 【模型下载加速（中国大陆用户可选）】
+#   export HF_ENDPOINT=https://hf-mirror.com
+#   （Whisper / wav2vec2 / Demucs 模型首次运行时从 HuggingFace 下载）
+# ============================================================
+
+gradio>=5.0,<6
+faster-whisper>=1.0
+transformers>=4.44,<5
+torch>=2.2
+torchaudio>=2.2
+demucs>=0.4.1
+soundfile>=0.12
+numpy
+
+# 开发 / 测试
+pytest>=8.0
