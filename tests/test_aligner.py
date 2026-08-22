@@ -1,5 +1,6 @@
 """core/aligner.py 单测：窗口规划/span 提取/分块/行分配/去重纯函数 + 假模型接缝的全流程。"""
 import threading
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -165,6 +166,43 @@ class TestAssignLines:
         # 2 行按语音比例（10:1）都落入块0；块1 基础为空 → (0,0)
         assert ranges[0] == (0, 2)
         assert ranges[1] == (0, 0)
+
+
+class TestForward:
+    """_forward 数值契约：fp32 log_softmax 输出（半精度 logits 也归一到 fp32）。"""
+
+    def _run(self, logits: torch.Tensor, device: str = "cpu"):
+        seen = {}
+
+        class FakeModel:
+            def __call__(self, x):
+                seen["input_dtype"] = x.dtype
+                return SimpleNamespace(logits=logits)
+
+        class FakeProcessor:
+            def __call__(self, waveform, sampling_rate=None, return_tensors=None):
+                return SimpleNamespace(input_values=torch.tensor(waveform).unsqueeze(0))
+
+        out = al_mod._forward(
+            np.zeros(100, dtype=np.float32), FakeModel(), FakeProcessor(), device
+        )
+        return out, seen
+
+    def test_cpu_input_stays_float32(self):
+        logits = torch.randn(1, 4, 8)
+        out, seen = self._run(logits, "cpu")
+        assert seen["input_dtype"] == torch.float32
+        assert out.dtype == torch.float32
+        expected = torch.log_softmax(logits, dim=-1).squeeze(0)
+        assert torch.allclose(out, expected)
+
+    def test_half_logits_normalized_to_float32(self):
+        """模拟 CUDA 半精度路径：fp16 logits 经 .float() 后做 fp32 log_softmax。"""
+        logits = torch.randn(1, 4, 8).half()
+        out, _ = self._run(logits, "cpu")
+        assert out.dtype == torch.float32
+        expected = torch.log_softmax(logits.float(), dim=-1).squeeze(0)
+        assert torch.allclose(out, expected, atol=1e-6)
 
 
 class TestChooseCandidate:

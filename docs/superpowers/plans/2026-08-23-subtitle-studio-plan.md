@@ -110,6 +110,14 @@
   unk（`_vocab_id` 大写回退）；盲识别英文词间空格丢失（whisper 前导空格转移
   到前词末尾，CJK 侧不补空格）。
 
+性能优化（2026-08-23 追加，仅无损项）：
+- GPU 批处理推理：`BatchedInferencePipeline`（batch_size=8），盲识别 2~4x；
+  批处理 OOM 时同档位退回逐段解码，不可用（旧版 faster-whisper）自动跳过
+- wav2vec2 CUDA 半精度前向（Ampere 原生 fp16），对齐约 1.5x；
+  log_softmax 固定 fp32 计算避免半精度下溢
+- `condition_on_previous_text=False`：长音频 10~20%，且减少重复幻觉
+- 启动后台预载默认盲识别模型（small × 环境量化策略），首个任务免付加载等待
+
 ## 关键风险与对策
 
 | 风险 | 对策 |

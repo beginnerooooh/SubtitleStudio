@@ -33,7 +33,26 @@ def _reset_model_cache():
 @pytest.fixture
 def fake_fw(monkeypatch):
     """注入假 faster_whisper；通过 oom_configs 控制哪些 (device, compute) 触发 OOM。"""
-    state = {"constructed": [], "oom_configs": set(), "error_configs": {}}
+    state = {
+        "constructed": [],
+        "oom_configs": set(),
+        "error_configs": {},
+        "batched_calls": [],
+        "batched_oom": False,
+        "sequential_calls": [],
+    }
+
+    def _segments():
+        return state.get("segments") or [
+            _FakeSegment([_FakeWord(" 你", 0.0, 0.4), _FakeWord("好。", 0.4, 0.9)], 0.9),
+            _FakeSegment([_FakeWord("世界", 1.2, 2.0)], 2.0),
+        ]
+
+    def _raise_if_configured(key):
+        if key in state["error_configs"]:
+            raise state["error_configs"][key]
+        if key in state["oom_configs"]:
+            raise RuntimeError("CUDA out of memory")
 
     class FakeModel:
         def __init__(self, model_size, device="cpu", compute_type="int8", **kwargs):
@@ -43,19 +62,25 @@ def fake_fw(monkeypatch):
             state["constructed"].append((model_size, device, compute_type))
 
         def transcribe(self, path, **kwargs):
-            key = (self.device, self.compute_type)
-            if key in state["error_configs"]:
-                raise state["error_configs"][key]
-            if key in state["oom_configs"]:
+            _raise_if_configured((self.device, self.compute_type))
+            state["sequential_calls"].append(kwargs)
+            return iter(_segments()), object()
+
+    class FakeBatched:
+        def __init__(self, model):
+            self.model = model
+
+        def transcribe(self, path, **kwargs):
+            key = (self.model.device, self.model.compute_type)
+            state["batched_calls"].append(kwargs)
+            if state["batched_oom"]:
                 raise RuntimeError("CUDA out of memory")
-            segments = state.get("segments") or [
-                _FakeSegment([_FakeWord(" 你", 0.0, 0.4), _FakeWord("好。", 0.4, 0.9)], 0.9),
-                _FakeSegment([_FakeWord("世界", 1.2, 2.0)], 2.0),
-            ]
-            return iter(segments), object()
+            _raise_if_configured(key)
+            return iter(_segments()), object()
 
     module = types.ModuleType("faster_whisper")
     module.WhisperModel = FakeModel
+    module.BatchedInferencePipeline = FakeBatched
     monkeypatch.setitem(sys.modules, "faster_whisper", module)
     return state
 
@@ -230,3 +255,64 @@ class TestWordSpacing:
         ]
         lines = self._t().transcribe("a.wav")
         assert [ln.text for ln in lines] == ["中文AI"]
+
+
+class TestBatchedPipeline:
+    """GPU 批处理推理（无损提速）：cuda 走批处理，OOM/不可用退回逐段解码。"""
+
+    def _t(self, device="cuda"):
+        return Transcriber(model_size="small", device=device, compute_type="float16")
+
+    def test_cuda_uses_batched_pipeline(self, fake_fw):
+        lines = self._t().transcribe("a.wav")
+        assert [ln.text for ln in lines] == ["你好。", "世界"]
+        assert len(fake_fw["batched_calls"]) == 1
+        kwargs = fake_fw["batched_calls"][0]
+        assert kwargs["batch_size"] == tr_mod._BATCH_SIZE
+        assert kwargs["beam_size"] == 5
+        assert kwargs["word_timestamps"] is True
+        assert kwargs["vad_filter"] is True
+        assert kwargs["condition_on_previous_text"] is False
+        assert kwargs["language"] is None  # auto
+        assert fake_fw["sequential_calls"] == []  # 未走逐段路径
+
+    def test_cpu_never_uses_batched(self, fake_fw):
+        t = Transcriber(model_size="small", device="cpu", compute_type="int8")
+        t.transcribe("a.wav")
+        assert fake_fw["batched_calls"] == []
+        assert len(fake_fw["sequential_calls"]) == 1
+
+    def test_batched_oom_falls_back_to_sequential_same_config(self, fake_fw):
+        fake_fw["batched_oom"] = True
+        lines = self._t().transcribe("a.wav")
+        assert [ln.text for ln in lines] == ["你好。", "世界"]
+        # 批处理 OOM 后同档位退回逐段，不触发模型重建/降档
+        assert len(fake_fw["batched_calls"]) == 1
+        assert len(fake_fw["sequential_calls"]) == 1
+        assert fake_fw["constructed"] == [("small", "cuda", "float16")]
+
+    def test_batched_unavailable_uses_sequential(self, fake_fw, monkeypatch):
+        monkeypatch.delattr(sys.modules["faster_whisper"], "BatchedInferencePipeline")
+        lines = self._t().transcribe("a.wav")
+        assert [ln.text for ln in lines] == ["你好。", "世界"]
+        assert fake_fw["batched_calls"] == []
+        assert len(fake_fw["sequential_calls"]) == 1
+
+    def test_batched_non_oom_error_propagates(self, fake_fw, monkeypatch):
+        class BrokenBatched:
+            def __init__(self, model):
+                pass
+
+            def transcribe(self, path, **kwargs):
+                raise ValueError("boom")
+
+        monkeypatch.setattr(
+            sys.modules["faster_whisper"], "BatchedInferencePipeline", BrokenBatched
+        )
+        with pytest.raises(ValueError, match="boom"):
+            self._t().transcribe("a.wav")
+
+    def test_condition_on_previous_text_disabled_sequential(self, fake_fw):
+        t = Transcriber(model_size="small", device="cpu", compute_type="int8")
+        t.transcribe("a.wav")
+        assert fake_fw["sequential_calls"][-1]["condition_on_previous_text"] is False

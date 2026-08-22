@@ -44,6 +44,38 @@ class TestUI:
         assert rows[0] == [1, "00:00.00", "00:01.00", "字"]
 
 
+class TestPreload:
+    def test_preload_loads_default_model_with_env_config(self, monkeypatch):
+        calls = []
+
+        class FakeEnv:
+            device = "cpu"
+            compute_type = "int8"
+
+        monkeypatch.setattr(app, "detect_env", lambda: FakeEnv())
+
+        import core.transcriber as tr_mod
+
+        monkeypatch.setattr(tr_mod, "_get_model", lambda size, dev, ct: calls.append((size, dev, ct)))
+        app._preload_model_once()
+        assert calls == [("small", "cpu", "int8")]
+
+    def test_preload_swallows_failure(self, monkeypatch):
+        class FakeEnv:
+            device = "cuda"
+            compute_type = "float16"
+
+        monkeypatch.setattr(app, "detect_env", lambda: FakeEnv())
+
+        import core.transcriber as tr_mod
+
+        def boom(size, dev, ct):
+            raise RuntimeError("model unavailable")
+
+        monkeypatch.setattr(tr_mod, "_get_model", boom)
+        app._preload_model_once()  # 不应抛出
+
+
 class TestWorker:
     def test_success_messages(self, monkeypatch, tmp_path):
         lines = [SubtitleLine(words=[SubtitleWord("你好", 0.0, 1.0)])]

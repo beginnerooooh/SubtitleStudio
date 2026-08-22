@@ -10,6 +10,9 @@ from core.models import SubtitleLine, SubtitleWord
 
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 
+# GPU 批处理推理的批大小（int8_float16 small/medium 在 4GB 显存下的安全值）
+_BATCH_SIZE = 8
+
 
 class TranscriptionError(RuntimeError):
     """盲识别失败（含所有量化档位均 OOM）。"""
@@ -60,6 +63,15 @@ def _bridge_space(prev_text: str, cur_text: str) -> bool:
     return not _CJK_RE.match(prev_text[-1]) and not _CJK_RE.match(cur_text[0])
 
 
+def _get_batched_pipeline(model):
+    """GPU 批处理流水线（faster-whisper >= 1.0）；不可用时返回 None。"""
+    try:
+        from faster_whisper import BatchedInferencePipeline
+    except ImportError:
+        return None
+    return BatchedInferencePipeline(model=model)
+
+
 class Transcriber:
     """faster-whisper 盲识别器：segments 逐段消费，支持进度回调与取消。"""
 
@@ -86,13 +98,7 @@ class Transcriber:
         for device, compute_type in self._fallback_chain():
             try:
                 model = _get_model(self.model_size, device, compute_type)
-                segments, _info = model.transcribe(
-                    path,
-                    language=None if self.language in (None, "auto") else self.language,
-                    vad_filter=True,
-                    word_timestamps=True,
-                    beam_size=5,
-                )
+                segments = self._decode(model, device, path)
                 return self._collect(segments, total_duration)
             except Exception as exc:
                 if not _is_oom(exc):
@@ -103,6 +109,28 @@ class Transcriber:
             f"显存不足：模型 {self.model_size} 在所有量化档位（含 CPU int8）均 OOM，"
             "请减小模型尺寸或改用 CPU 模式"
         ) from last_oom
+
+    def _decode(self, model, device: str, path: str):
+        """解码入口：GPU 优先批处理流水线（2~4x），OOM 或不可用退回逐段解码。"""
+        kwargs = {
+            "language": None if self.language in (None, "auto") else self.language,
+            "vad_filter": True,
+            "word_timestamps": True,
+            "beam_size": 5,
+            # 不携带上文 kv cache：长音频提速 10~20%，且显著减少重复幻觉
+            "condition_on_previous_text": False,
+        }
+        if device == "cuda":
+            batched = _get_batched_pipeline(model)
+            if batched is not None:
+                try:
+                    segments, _info = batched.transcribe(path, batch_size=_BATCH_SIZE, **kwargs)
+                    return segments
+                except Exception as exc:
+                    if not _is_oom(exc):
+                        raise
+        segments, _info = model.transcribe(path, **kwargs)
+        return segments
 
     def _fallback_chain(self) -> list[tuple[str, str]]:
         """从当前配置出发的 (device, compute_type) 降档序列。"""

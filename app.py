@@ -256,5 +256,28 @@ def build_ui() -> gr.Blocks:
 
 demo = build_ui()
 
+
+# ---------------- 模型预载 ----------------
+
+def _preload_model_once() -> None:
+    """同步预载默认盲识别模型（small + 环境量化策略），命中流水线模型缓存。
+
+    失败静默忽略：预载只是优化，首次任务时会再次加载并正常报错。
+    """
+    try:
+        from core.transcriber import _get_model
+
+        env = detect_env()
+        _get_model("small", env.device, env.compute_type)
+    except Exception:
+        pass
+
+
+def _preload_default_model() -> None:
+    """启动时后台线程预载，不阻塞 UI。"""
+    threading.Thread(target=_preload_model_once, daemon=True).start()
+
+
 if __name__ == "__main__":
+    _preload_default_model()
     demo.queue().launch()

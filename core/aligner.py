@@ -245,6 +245,8 @@ def _get_models(language: str, device: str):
         raise AlignmentError(f"不支持的对齐语言：{language}（可选：{'/'.join(_MODEL_IDS)}）")
     processor = Wav2Vec2Processor.from_pretrained(model_id)
     model = Wav2Vec2ForCTC.from_pretrained(model_id).to(device).eval()
+    if device == "cuda":
+        model = model.half()  # Ampere fp16：前向约 1.5x，log_softmax 已单独回 fp32
     vocab = processor.tokenizer.get_vocab()
     blank_id = vocab[processor.tokenizer.pad_token]  # wav2vec2 的 CTC blank 即 <pad>
     sep_token = getattr(processor.tokenizer, "word_delimiter_token", None)
@@ -257,13 +259,22 @@ def _get_models(language: str, device: str):
 
 
 def _forward(waveform, model, processor, device):
-    """单窗前向：波形 → (T, V) 归一化 log_probs（CPU float32，控制内存峰值）。"""
+    """单窗前向：波形 → (T, V) 归一化 log_probs（CPU float32，控制内存峰值）。
+
+    CUDA 上用 fp16 权重/输入（Ampere 原生支持，约 1.5x）；
+    log_softmax 固定在 fp32 计算后再转 CPU，避免半精度下溢。
+    """
     import torch
 
     inputs = processor(waveform, sampling_rate=SAMPLE_RATE, return_tensors="pt")
+    dtype = torch.float16 if device == "cuda" else torch.float32
     with torch.no_grad():
-        logits = model(inputs.input_values.to(device)).logits
-    return torch.log_softmax(logits, dim=-1).squeeze(0).to("cpu", torch.float32)
+        logits = model(inputs.input_values.to(device, dtype)).logits
+    return (
+        torch.log_softmax(logits.float(), dim=-1)
+        .squeeze(0)
+        .to("cpu", torch.float32)
+    )
 
 
 def _forced_align(log_probs, char_ids, blank_id) -> list[TokenSpan]:
