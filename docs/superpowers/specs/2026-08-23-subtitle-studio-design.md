@@ -46,6 +46,19 @@
 │   ├── pipeline.py         # 流水线编排 + 进度回调 + 取消
 │   └── subtitle.py         # SRT / LRC / ASS 生成器（纯函数）
 ├── profiles/               # 主播声纹库（<主播名>.npy，双音色 embedding）
+├── packaging/              # Windows 商用打包（详见 docs/PACKAGING.md）
+│   ├── build_portable.py   # 一键构建便携目录（Embedded Python/依赖/FFmpeg/源码过滤）
+│   ├── build.bat           # Windows 构建入口（参数透传）
+│   ├── launcher.py         # 启动器：环境变量预热/端口健康检查/自动开浏览器/优雅退出
+│   ├── run.bat / run-debug.bat / stop.bat   # 用户双击入口（静默/调试/停止）
+│   ├── installer.iss       # Inno Setup 6 安装包脚本（中文向导/VC++检测/卸载保留数据）
+│   ├── version.txt         # 版本号唯一来源
+│   ├── app.ico             # 应用图标（多尺寸）
+│   └── LICENSE.txt         # EULA 模板（发布前替换）
+├── models/
+│   └── download_models.py  # 离线模型预下载（basic/full 预设，制作纯离线完整版）
+├── docs/
+│   └── PACKAGING.md        # 打包实操指南（从克隆到 Setup.exe 的完整命令流程）
 └── tests/
     ├── test_text.py        # 标准化/分字分词/标点回填（纯逻辑）
     ├── test_subtitle.py    # 字幕格式生成（纯逻辑）
@@ -57,10 +70,19 @@
     ├── test_voiceprint.py  # Profile 存取/相似度比对/区域合并（mock 模型接缝）
     ├── test_song_recognizer.py # 块合并/时间戳格式化/识曲控制流（mock shazamio）
     ├── test_pipeline.py    # 编排状态机（mock 各阶段）
+    ├── test_launcher.py    # 启动器：环境预热/端口探测/健康检查/停止信号
+    ├── test_build_portable.py  # 构建脚本：源码过滤/._pth/FFmpeg 提取/瘦身/下载
+    ├── test_download_models.py # 模型预下载：预设与显式参数合并
     └── test_pipeline_smoke.py  # 集成冒烟（slow，需真实模型）
 ```
 
 模块边界：`pipeline.py` 只做编排不碰算法；core 各模块可独立使用；模型全部懒加载 + 进程内缓存（换文件不重载模型）。
+
+**打包设计要点（零环境依赖）**：最终用户机器无需预装 Python/Git/CUDA Toolkit/FFmpeg。
+Embedded Python + 全依赖内置于 `runtime/`；FFmpeg 静态二进制内置于 `bin/`，
+由 launcher 进程内注入 `PATH`（`shutil.which` 直接命中，核心代码零改动）；
+`HF_HOME`/`TORCH_HOME`/`MODELSCOPE_CACHE` 全部指向安装目录 `models/`，
+不写 C 盘用户缓存；卸载时可选保留 outputs/profiles/models 用户数据。
 
 ## 4. 数据模型（统一中间表示）
 
