@@ -316,3 +316,29 @@ class TestBatchedPipeline:
         t = Transcriber(model_size="small", device="cpu", compute_type="int8")
         t.transcribe("a.wav")
         assert fake_fw["sequential_calls"][-1]["condition_on_previous_text"] is False
+
+
+class TestClipTimestamps:
+    """声纹过滤后的定向转写：区域展平传入，空区域短路返回。"""
+
+    def test_regions_flattened_and_passed(self, fake_fw):
+        t = Transcriber(model_size="small", device="cpu", compute_type="int8")
+        t.transcribe("a.wav", clip_timestamps=[(0.0, 1.5), (10.0, 20.0)])
+        assert fake_fw["sequential_calls"][-1]["clip_timestamps"] == [0.0, 1.5, 10.0, 20.0]
+
+    def test_none_means_whole_file(self, fake_fw):
+        t = Transcriber(model_size="small", device="cpu", compute_type="int8")
+        t.transcribe("a.wav", clip_timestamps=None)
+        assert "clip_timestamps" not in fake_fw["sequential_calls"][-1]
+
+    def test_empty_regions_skip_model_entirely(self, fake_fw):
+        t = Transcriber(model_size="small", device="cpu", compute_type="int8")
+        lines = t.transcribe("a.wav", clip_timestamps=[])
+        assert lines == []
+        assert fake_fw["sequential_calls"] == []
+        assert fake_fw["constructed"] == []
+
+    def test_cuda_batched_path_receives_clips(self, fake_fw):
+        t = Transcriber(model_size="small", device="cuda", compute_type="float16")
+        t.transcribe("a.wav", clip_timestamps=[(5.0, 9.0)])
+        assert fake_fw["batched_calls"][-1]["clip_timestamps"] == [5.0, 9.0]

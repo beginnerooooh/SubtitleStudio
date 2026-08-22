@@ -21,7 +21,7 @@
 #
 # 【模型下载加速（中国大陆用户可选）】
 #   export HF_ENDPOINT=https://hf-mirror.com
-#   （Whisper / wav2vec2 / Demucs 模型首次运行时从 HuggingFace 下载）
+#   （Whisper / wav2vec2 / Demucs / ECAPA 声纹模型首次运行时从 HuggingFace 下载）
 # ============================================================
 
 gradio>=5.0,<6
@@ -32,6 +32,11 @@ torchaudio>=2.2
 demucs>=0.4.1
 soundfile>=0.12
 numpy
+
+# 直播场景：主声线声纹过滤（ECAPA-TDNN 声纹提取，speechbrain 1.x）
+speechbrain>=1.0
+# 直播场景：听歌识曲（Shazam 在线识别，异步库，仅在开启识曲时联网使用）
+shazamio>=0.6
 
 # 开发 / 测试
 pytest>=8.0

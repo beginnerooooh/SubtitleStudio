@@ -41,16 +41,21 @@
 │   ├── separator.py        # Demucs 人声分离（可选）
 │   ├── transcriber.py      # faster-whisper 盲识别
 │   ├── aligner.py          # wav2vec2 CTC 强制对齐（全局 + 滑窗分块策略）
+│   ├── voiceprint.py       # 主声线声纹：ECAPA 提取/双音色 Profile/分段比对过滤
+│   ├── song_recognizer.py  # 听歌识曲：shazamio 封装 + 演唱块合并 + 歌单时间戳导出
 │   ├── pipeline.py         # 流水线编排 + 进度回调 + 取消
 │   └── subtitle.py         # SRT / LRC / ASS 生成器（纯函数）
+├── profiles/               # 主播声纹库（<主播名>.npy，双音色 embedding）
 └── tests/
     ├── test_text.py        # 标准化/分字分词/标点回填（纯逻辑）
     ├── test_subtitle.py    # 字幕格式生成（纯逻辑）
     ├── test_env.py         # 环境探测（mock）
     ├── test_audio.py       # FFmpeg 转码（mock + ffmpeg 静音夹具）
-    ├── test_transcriber.py # 降档链/进度回调（mock）
+    ├── test_transcriber.py # 降档链/进度回调/clip_timestamps（mock）
     ├── test_separator.py   # 失败回退/显存释放（mock）
     ├── test_aligner.py     # 行分配/重叠去歧义/置信度（mock 前向）
+    ├── test_voiceprint.py  # Profile 存取/相似度比对/区域合并（mock 模型接缝）
+    ├── test_song_recognizer.py # 块合并/时间戳格式化/识曲控制流（mock shazamio）
     ├── test_pipeline.py    # 编排状态机（mock 各阶段）
     └── test_pipeline_smoke.py  # 集成冒烟（slow，需真实模型）
 ```
@@ -74,12 +79,42 @@ class SubtitleLine:
 
 三种导出格式全部从 `SubtitleLine[]` 生成，不重复计算时间。
 
+直播场景扩展数据模型（`core/voiceprint.py` / `core/song_recognizer.py`）：
+
+```python
+@dataclass
+class VoiceProfile:          # 主播声纹（双音色注册集）
+    name: str                # 主播名（即 profiles/<name>.npy 文件名）
+    speak: np.ndarray|None   # 说话声线 embedding（L2 归一化，192 维）
+    sing:  np.ndarray|None   # 唱歌声线 embedding（可选注册）
+
+@dataclass
+class SegmentVerdict:        # 单个 VAD 语音段的声纹判定
+    start: float; end: float
+    speak_sim: float|None    # 与说话声纹的余弦相似度
+    sing_sim:  float|None    # 与唱歌声纹的余弦相似度
+    best_sim   = max(两者)   # 双音色取最大：解决唱歌音色漂移误过滤
+    is_singing = sing_sim > speak_sim  # 唱歌状态判定
+
+@dataclass
+class SongEntry:             # 歌单时间戳条目
+    start: float; end: float
+    title: str; artist: str
+    confidence: float|None   # Shazam 返回时展示，缺省省略
+```
+
 ## 5. 流水线设计
 
 ### 5.1 全局进度状态机
 
 ```
 抽取音频(5%) → 人声分离(25%, 可选) → 识别/对齐(60%) → 聚合导出(10%)
+```
+
+直播场景（两项开关均关闭时与上图完全一致）：
+
+```
+抽取音频 → 人声分离(可选) → [语音分析：VAD分段 → 声纹过滤 → 唱歌段识曲] → 语音转写(仅保留区域) → 导出(字幕 + 歌单时间戳)
 ```
 
 - 各模块通过 `on_progress(stage, ratio, message)` 回调上报
@@ -151,6 +186,54 @@ class SubtitleLine:
 - LRC：`[mm:ss.xx]` + `[ti:][re:]` 元标签
 - ASS：完整 header（PlayResX/Y、Default 样式 + Karaoke 高亮样式）；`{\k<n>}` 逐字（n = 厘秒）；末字自动延音至行尾；行文本 = words 用原文连接还原
 
+### 5.8 voiceprint.py — 主声线声纹过滤（直播场景）
+
+**声学模型**：`speechbrain/spkrec-ecapa-voxceleb`（ECAPA-TDNN，192 维 embedding，
+~80MB，CPU 提取 ~0.1x 实时；懒加载 + 进程内缓存）。备选 `3D-Speaker/CAM++`
+（modelscope），当前版本未集成。
+
+**双音色注册集（Enrollment Profiles）**：
+- UI 录入两个参考音频（各 10~30s 清晰干声）：A=日常说话声线（必填）、B=唱歌/高音
+  音色（可选）。上传样本先经 FFmpeg 转为 16kHz mono WAV（复用 `audio.extract_wav`），
+  再过 ECAPA 提取 embedding，L2 归一化后持久化为 `profiles/<主播名>.npy`
+  （`{"speak": ..., "sing": ...}` dict 容器，np.save 对象数组）
+- 主播名校验：非空、无路径分隔符/非法字符、≤64 字符；样本近静音（峰值 < 1e-4）拒绝
+
+**分段比对逻辑**（仅盲识别模式；对齐模式歌词即目标内容，不过滤）：
+1. Silero VAD（复用 faster-whisper 内置 `get_speech_timestamps`）切出语音段
+2. 每段音频**居中截取 ≤30s** 送 ECAPA（模型训练分布为短语句；唱歌长段截中段），
+   按累计 ≤60s 分批前向控制内存
+3. `Sim = max(Sim_speak, Sim_sing)` —— 唱歌音色整体漂移由唱歌声纹兜底，
+   避免副歌高音区被误过滤
+4. `Sim < threshold`（UI 可调 0.3~0.8，默认 0.55）→ 判为背景音/BGM 人声/其他人声，
+   **转写前剔除**（不浪费 whisper 算力）
+5. 保留段合并（间隔 ≤1s 合并、边界 ±0.25s padding、<0.5s 碎片丢弃）后作为
+   faster-whisper `clip_timestamps` 定向转写，时间戳保持全局时间轴
+
+**边界**：全部段落被过滤 → 空字幕 + 警告（不报错）；声纹过滤对
+「音色相近的连麦嘉宾」区分度有限（ECAPA 等误识率场景），阈值建议从宽松
+（0.45）起调。
+
+### 5.9 song_recognizer.py — 唱歌检测与听歌识曲（直播场景）
+
+**触发条件**（`enable_song_detect` 开启时）：
+- 候选段 = 双音色 Profile 判定为唱歌（`is_singing`）的语音段；无唱歌声纹时
+  退化为「持续 > 30s 的人声段」
+- 相邻候选段间隔 ≤10s 合并为**演唱块**（VAD 间奏切分不碎歌）；块总时长 <30s 丢弃
+- 每块从**原始输入文件**（含伴奏，非分离人声轨）FFmpeg 截取前 12s 高保真片段
+  （44.1kHz stereo），经 `shazamio`（异步库，`asyncio.run` + 30s 超时包装为同步）
+  识别 `title / subtitle(artist) / confidence`
+- 识别成功的演唱块**从转写区域剔除**（歌声 whisper 转写只会产生幻觉歌词）；
+  识别失败的块保留转写（尽力兜底）；相邻同名歌曲条目（间隔 ≤30s）合并为一条
+
+**歌单导出**（与字幕同目录 `outputs/<任务名>/`）：
+- `songs_timeline.md`：`- [HH:MM:SS - HH:MM:SS] 《title》- artist (置信度: xx%)`
+- `songs_timeline.csv`：`start,end,title,artist,confidence`（csv 模块转义）
+- 开关开启即生成（无歌曲时输出「未检测到歌曲」提示头）
+
+**隐私与可用性**：识曲需联网访问 Shazam 服务（上传音频指纹）；网络不可达/无匹配
+→ 日志提示并跳过，任务不中断。
+
 ## 6. GUI 设计（Gradio）
 
 ```
@@ -164,10 +247,18 @@ class SubtitleLine:
 │ 设备下拉(自动/CUDA/CPU) · 模型大小(tiny~large-v3) │
 │ 伴奏分离开关 · 语言(自动/中/英) · 导出格式多选    │
 ├─────────────────────────────────────────────┤
+│ ▸ 折叠区：主播声纹与歌单（直播场景，可选）        │
+│   [x] 启用主声线声纹过滤  [x] 自动识曲生成歌单   │
+│   主播 Profile 下拉(历史) + [刷新]              │
+│   声纹匹配严格度滑块(0.3~0.8, 默认0.55)         │
+│   新增主播：名称 + 说话样本 + 唱歌样本(可选)      │
+│           + [提取并保存声纹] + 状态提示          │
+├─────────────────────────────────────────────┤
 │ [开始生成] [取消] 进度条 + 阶段文字             │
 │ 实时日志面板（滚动 append）                    │
 │ 预览表格（行号/起止/文本，前 500 行 + 提示）     │
-│ 下载区（每个勾选格式一个文件按钮）               │
+│ 歌单时间戳面板（md 文本 + 一键复制 + 下载）      │
+│ 下载区（每个勾选格式一个文件按钮 + 歌单两件）     │
 └─────────────────────────────────────────────┘
 ```
 
@@ -188,6 +279,10 @@ class SubtitleLine:
 | Demucs 失败/依赖缺失 | 警告 + 回退原始音频继续 |
 | 歌词全空/仅标点 | 前端 + 后端双重校验，自动转盲识别并提示 |
 | 对齐低置信区间 | 日志标记「建议人工复核」，不中断 |
+| 声纹 Profile 缺失/损坏 | `VoiceprintError` → UI 明确提示先创建/重选 Profile |
+| 全部语音段被声纹过滤 | 空字幕 + 警告，任务正常结束 |
+| Shazam 网络不可达/超时/无匹配 | 日志提示 + 该段保留转写，任务不中断 |
+| ECAPA 模型加载失败（speechbrain 未装） | `VoiceprintError` 明确指引安装 |
 | 模型下载失败 | 报错提示检查网络 / HF_ENDPOINT 镜像 |
 | 不支持格式 | 白名单校验 |
 | 未知异常 | 兜底捕获 → 日志完整 traceback → UI 友好摘要 |
@@ -197,7 +292,9 @@ class SubtitleLine:
 - `test_subtitle.py`：SRT/LRC/ASS 纯逻辑（时间格式化、ms→厘秒换算、延音、聚合规则、原文还原）
 - `test_text.py`：标准化/分字分词/内嵌时间戳剥离/中英混合切分/**标点剥离与回填 round-trip**
 - `test_aligner.py`：长音频行分配 + ±2 行重叠去歧义 + 置信度（纯逻辑部分，模型前向 monkeypatch）
-- `test_env.py` / `test_audio.py` / `test_transcriber.py` / `test_separator.py` / `test_pipeline.py`：mock 依赖测控制流（降档链、回退、进度汇总、取消）
+- `test_env.py` / `test_audio.py` / `test_transcriber.py` / `test_separator.py` / `test_pipeline.py`：mock 依赖测控制流（降档链、回退、进度汇总、取消、声纹过滤区域传递、识曲剔除）
+- `test_voiceprint.py`：Profile 存取 round-trip、余弦相似度/双音色取最大/唱歌判定、区域合并（padding/碎片丢弃）、名称与静音校验（模型接缝 monkeypatch）
+- `test_song_recognizer.py`：演唱块合并（间奏不碎歌）、同名条目合并、md/csv 精确格式、识曲成功/失败/超时控制流（mock shazamio 与 FFmpeg 截取）
 - `test_pipeline_smoke.py`：`@pytest.mark.slow`，需真实模型 + 样例音频，本地手动
 - 手动验收：短视频（盲识别）+ 一首歌（对齐）+ 长音频（≥30min 进度/取消/显存）各跑通全流程，含 LRC/ASS 输出在播放器验证
 
@@ -213,6 +310,8 @@ torch / torchaudio（CUDA 版经 --index-url 安装，注释说明）
 demucs
 soundfile
 numpy
+speechbrain          # 声纹提取（ECAPA-TDNN，直播场景；懒加载，未装时明确报错）
+shazamio             # 听歌识曲（直播场景；需联网访问 Shazam 服务）
 ```
 
 环境要求：Python ≥ 3.10；FFmpeg 系统安装（Windows 配 PATH）；NVIDIA GPU 可选（自动检测）；HF 镜像可选（HF_ENDPOINT）。

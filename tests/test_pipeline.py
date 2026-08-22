@@ -1,6 +1,7 @@
 """core/pipeline.py 单测：编排状态机、进度汇总、取消、Demucs 回退、异常映射（全阶段 mock）。"""
 import threading
 
+import numpy as np
 import pytest
 
 import core.pipeline as pl
@@ -9,8 +10,10 @@ from core.env import EnvInfo
 from core.errors import TaskCancelled
 from core.models import SubtitleLine, SubtitleWord
 from core.pipeline import Pipeline, PipelineConfig, PipelineError
+from core.song_recognizer import SongEntry
 from core.text import prepare_lyrics
 from core.transcriber import TranscriptionError
+from core.voiceprint import SegmentVerdict, VoiceProfile, VoiceprintError
 
 
 def _env(ffmpeg="/usr/bin/ffmpeg", device="cpu"):
@@ -37,6 +40,11 @@ def fakes(monkeypatch, tmp_path):
         "align_error": None,
         "env": _env(),
         "duration": 100.0,
+        "vad_segments": [(0.0, 5.0), (20.0, 30.0)],
+        "verdicts": None,          # None = 不做相似度区分（全部命中）
+        "profile_error": None,
+        "song_entries": [],
+        "song_blocks": None,       # 记录传给识别器的演唱块
     }
     wav = str(tmp_path / "in.wav")
     vocals = str(tmp_path / "vocals.wav")
@@ -49,9 +57,10 @@ def fakes(monkeypatch, tmp_path):
             )
             self.on_progress = on_progress
 
-        def transcribe(self, path, total_duration=None):
+        def transcribe(self, path, total_duration=None, clip_timestamps=None):
             state["transcriber_path"] = path
             state["transcriber_total"] = total_duration
+            state["transcriber_clips"] = clip_timestamps
             if state["transcribe_error"]:
                 raise state["transcribe_error"]
             if state["transcribe_cancel"]:
@@ -99,12 +108,54 @@ def fakes(monkeypatch, tmp_path):
                 return wav_path
             return vocals
 
+    class FakeEngine:
+        def __init__(self, device="cpu"):
+            state["engine_device"] = device
+
+        def classify_segments(self, wav_path, segments, profile,
+                              on_progress=None):
+            state["classify_segments"] = list(segments)
+            if state["verdicts"] is None:  # 默认全部高相似度命中
+                sims = [(0.9, None) for _ in segments]
+            else:
+                sims = state["verdicts"]
+            verdicts = [
+                SegmentVerdict(start=s, end=e, speak_sim=sp, sing_sim=sg)
+                for (s, e), (sp, sg) in zip(segments, sims)
+            ]
+            if on_progress:
+                on_progress(1.0)
+            return verdicts
+
+    class FakeRecognizer:
+        def __init__(self, ffmpeg="ffmpeg", on_log=None, on_progress=None,
+                     cancel_event=None, **kw):
+            self.on_log = on_log or (lambda m: None)
+            self.on_progress = on_progress or (lambda r: None)
+
+        def recognize_blocks(self, source_path, blocks, work_dir):
+            state["song_blocks"] = list(blocks)
+            state["song_source"] = source_path
+            for i, _ in enumerate(blocks):
+                self.on_progress((i + 1) / len(blocks) if blocks else 1.0)
+            return list(state["song_entries"])
+
+    def fake_load_profile(name, profiles_dir="profiles"):
+        if state["profile_error"]:
+            raise state["profile_error"]
+        return VoiceProfile(name=name,
+                            speak=np.ones(192, dtype=np.float32), sing=None)
+
     monkeypatch.setattr(pl, "Transcriber", FakeTranscriber)
     monkeypatch.setattr(pl, "Aligner", FakeAligner)
     monkeypatch.setattr(pl, "VocalSeparator", FakeSeparator)
+    monkeypatch.setattr(pl, "VoiceprintEngine", FakeEngine)
+    monkeypatch.setattr(pl, "SongRecognizer", FakeRecognizer)
+    monkeypatch.setattr(pl, "load_profile", fake_load_profile)
+    monkeypatch.setattr(pl, "speech_intervals", lambda path: state["vad_segments"])
     monkeypatch.setattr(pl, "detect_env", lambda force=False: state["env"])
     monkeypatch.setattr(pl, "probe_duration", lambda path, **kw: state["duration"])
-    monkeypatch.setattr(pl, "validate_input", lambda path: None)
+    monkeypatch.setattr(pl, "validate_input", lambda path: state.update(input_path=path))
     monkeypatch.setattr(pl, "extract_wav", lambda src, dst_dir, **kw: wav)
     state["vocals"] = vocals
     state["wav"] = wav
@@ -277,3 +328,138 @@ class TestEnvGuard:
         Pipeline(cfg).run()
         assert fakes["transcriber_kwargs"]["device"] == "cuda"
         assert fakes["transcriber_kwargs"]["compute_type"] == "float16"
+
+
+class TestVoiceprintFilter:
+    def _cfg(self, tmp_path, **kw):
+        return PipelineConfig(
+            input_path=_make_input(tmp_path), work_dir=str(tmp_path / "out"),
+            enable_voiceprint=True, profile_name="测试主播", **kw,
+        )
+
+    def test_kept_segments_become_clip_timestamps(self, fakes, tmp_path):
+        fakes["verdicts"] = [(0.9, None), (0.2, None)]  # 段2 低于阈值
+        logs = []
+        result = Pipeline(self._cfg(tmp_path), on_log=logs.append).run()
+        assert fakes["classify_segments"] == [(0.0, 5.0), (20.0, 30.0)]
+        # 仅保留段 1 → 定向转写区域（±0.25s padding，夹紧到 0）
+        assert fakes["transcriber_clips"] == [(0.0, 5.25)]
+        assert any("声纹过滤" in m and "1/2" in m for m in logs)
+        # 字幕仍正常生成
+        assert [ln.text for ln in result.lines] == ["你好世界"]
+
+    def test_dual_tone_sing_similarity_rescues_segment(self, fakes, tmp_path):
+        # 说话相似度低但唱歌相似度高 → 双音色取最大，段保留
+        fakes["verdicts"] = [(0.3, 0.8), (0.9, None)]
+        result = Pipeline(self._cfg(tmp_path)).run()
+        assert fakes["transcriber_clips"] == [(0.0, 5.25), (19.75, 30.25)]
+
+    def test_all_below_threshold_skips_transcription(self, fakes, tmp_path):
+        fakes["verdicts"] = [(0.2, None), (0.3, None)]
+        result = Pipeline(self._cfg(tmp_path)).run()
+        assert result.lines == []
+        assert fakes["transcriber_path"] is None  # 未调用转写
+        assert any("低于声纹相似度阈值" in w for w in result.warnings)
+
+    def test_threshold_configurable(self, fakes, tmp_path):
+        fakes["verdicts"] = [(0.6, None), (0.2, None)]
+        result = Pipeline(self._cfg(tmp_path, voice_threshold=0.6)).run()
+        assert fakes["transcriber_clips"] == [(0.0, 5.25)]
+
+    def test_profile_error_mapped(self, fakes, tmp_path):
+        fakes["profile_error"] = VoiceprintError("未找到主播「x」的声纹 Profile")
+        with pytest.raises(PipelineError, match="声纹分析失败.*未找到主播"):
+            Pipeline(self._cfg(tmp_path)).run()
+
+    def test_no_speech_segments(self, fakes, tmp_path):
+        fakes["vad_segments"] = []
+        result = Pipeline(self._cfg(tmp_path)).run()
+        assert result.lines == []
+        assert any("未检测到语音活动" in w for w in result.warnings)
+
+
+class TestSongDetect:
+    def _cfg(self, tmp_path, **kw):
+        return PipelineConfig(
+            input_path=_make_input(tmp_path), work_dir=str(tmp_path / "out"),
+            enable_song_detect=True, **kw,
+        )
+
+    def test_song_exported_and_span_removed_from_transcription(self, fakes, tmp_path):
+        fakes["vad_segments"] = [(0.0, 40.0), (50.0, 60.0)]  # 段1 为 >30s 演唱候选
+        fakes["song_entries"] = [SongEntry(
+            start=0.0, end=40.0, title="晴天", artist="周杰伦", confidence=98.0)]
+        logs = []
+        result = Pipeline(self._cfg(tmp_path), on_log=logs.append).run()
+        # 演唱块从原始输入截取（含伴奏）
+        assert fakes["song_blocks"] == [(0.0, 40.0)]
+        assert fakes["song_source"] == fakes["input_path"]
+        # 已识别演唱块剔出转写区域 → 只转写剩余段
+        assert fakes["transcriber_clips"] == [(49.75, 60.25)]
+        # 歌单条目与导出文件
+        assert [s.title for s in result.songs] == ["晴天"]
+        assert "songs_md" in result.files and "songs_csv" in result.files
+        with open(result.files["songs_md"], encoding="utf-8") as f:
+            md = f.read()
+        assert "《晴天》- 周杰伦" in md and "00:00:00 - 00:00:40" in md
+        with open(result.files["songs_csv"], encoding="utf-8") as f:
+            csv_text = f.read()
+        assert "晴天" in csv_text and "周杰伦" in csv_text
+        assert any("共识别到 1 首歌曲" in m for m in logs)
+
+    def test_short_segments_not_candidates(self, fakes, tmp_path):
+        # 所有段 < 30s → 无演唱候选，整段转写
+        logs = []
+        result = Pipeline(self._cfg(tmp_path), on_log=logs.append).run()
+        assert fakes["song_blocks"] is None  # 识别器未被调用
+        assert any("未检测到符合条件的演唱段" in m for m in logs)
+        assert fakes["transcriber_clips"] == [(0.0, 5.25), (19.75, 30.25)]
+        assert result.songs == []
+        # 未识别到歌曲仍导出占位歌单（用户显式开启了该功能）
+        assert "songs_md" in result.files
+
+    def test_unrecognized_song_keeps_transcription(self, fakes, tmp_path):
+        # 识别失败的演唱块保留转写兜底
+        fakes["vad_segments"] = [(0.0, 40.0)]
+        fakes["song_entries"] = []  # Shazam 未命中
+        result = Pipeline(self._cfg(tmp_path)).run()
+        assert result.songs == []
+        assert fakes["transcriber_clips"] == [(0.0, 40.25)]
+
+    def test_singing_verdicts_drive_candidates(self, fakes, tmp_path):
+        # 注册唱歌声纹后：is_singing 判定段（而非长段）作为识曲候选
+        fakes["vad_segments"] = [(0.0, 35.0), (50.0, 55.0)]
+        fakes["verdicts"] = [(0.2, 0.9), (0.9, None)]  # 段1 唱歌、段2 说话
+        fakes["song_entries"] = [SongEntry(
+            start=0.0, end=35.0, title="起风了", artist="买辣椒也用券")]
+        cfg = PipelineConfig(
+            input_path=_make_input(tmp_path), work_dir=str(tmp_path / "out"),
+            enable_voiceprint=True, profile_name="测试主播",
+            enable_song_detect=True,
+        )
+        result = Pipeline(cfg).run()
+        # 唱歌判定段 (0,35) ≥30s 成为唯一候选块
+        assert fakes["song_blocks"] == [(0.0, 35.0)]
+        assert [s.title for s in result.songs] == ["起风了"]
+        # 演唱块从转写区域剔除，仅保留说话段
+        assert fakes["transcriber_clips"] == [(49.75, 55.25)]
+        assert [ln.text for ln in result.lines] == ["你好世界"]
+
+
+class TestLiveModeGuards:
+    def test_align_mode_skips_live_features_with_warning(self, fakes, tmp_path):
+        logs = []
+        cfg = PipelineConfig(
+            input_path=_make_input(tmp_path), work_dir=str(tmp_path / "out"),
+            lyrics_text="你好\n世界",
+            enable_voiceprint=True, profile_name="测试主播",
+            enable_song_detect=True,
+        )
+        result = Pipeline(cfg, on_log=logs.append).run()
+        assert result.mode == "align"
+        assert any("仅支持盲识别模式" in w for w in result.warnings)
+        # 声纹分析与识曲均未执行
+        assert fakes.get("classify_segments") is None
+        assert fakes["song_blocks"] is None
+        # 对齐模式不导出歌单文件
+        assert "songs_md" not in result.files and "songs_csv" not in result.files

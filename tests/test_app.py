@@ -9,6 +9,8 @@ import app
 from core.errors import TaskCancelled
 from core.models import SubtitleLine, SubtitleWord
 from core.pipeline import PipelineConfig, PipelineError
+from core.song_recognizer import SongEntry
+from core.voiceprint import VoiceprintError
 
 
 @pytest.fixture(scope="module")
@@ -42,6 +44,124 @@ class TestUI:
         rows = app._preview_rows(result, limit=500)
         assert len(rows) == 500
         assert rows[0] == [1, "00:00.00", "00:01.00", "字"]
+
+
+class TestSongsPanel:
+    def _result(self, songs):
+        from core.pipeline import PipelineResult
+
+        return PipelineResult(mode="blind", duration=600.0, lines=[],
+                              files={}, warnings=[], out_dir="", songs=songs)
+
+    def test_songs_markdown_formats_entries(self):
+        songs = [SongEntry(start=932.0, end=1185.0, title="晴天", artist="周杰伦",
+                           confidence=98.0)]
+        md = app._songs_markdown(self._result(songs))
+        assert "《晴天》- 周杰伦" in md
+        assert "00:15:32 - 00:19:45" in md
+        assert "置信度: 98%" in md
+
+    def test_songs_markdown_placeholder_when_empty(self):
+        assert "未识别到歌曲" in app._songs_markdown(self._result([]))
+
+    def test_songs_markdown_placeholder_when_none(self):
+        assert "未识别到歌曲" in app._songs_markdown(None)
+
+
+class TestProfileManagement:
+    def test_save_requires_name(self):
+        msg, update = app.save_streamer_profile("", "/tmp/a.wav", None, "自动")
+        assert "主播名" in msg
+
+    def test_save_requires_speak_sample(self):
+        msg, update = app.save_streamer_profile("小明", None, None, "自动")
+        assert "说话样本" in msg
+
+    def test_save_success_refreshes_dropdown(self, monkeypatch, tmp_path):
+        saved = {}
+
+        def fake_save(name, speak, sing, profiles_dir="profiles", device="cpu"):
+            saved.update(name=name, speak=speak, sing=sing,
+                         profiles_dir=profiles_dir, device=device)
+            return tmp_path / f"{name}.npy"
+
+        monkeypatch.setattr(app, "save_profile", fake_save)
+        monkeypatch.setattr(app, "list_profiles",
+                            lambda d: ["小明", "小红"])
+        msg, update = app.save_streamer_profile("小明", "/tmp/a.wav", "/tmp/b.wav", "CPU")
+        assert "已保存" in msg and "小明" in msg
+        assert saved == dict(name="小明", speak="/tmp/a.wav", sing="/tmp/b.wav",
+                             profiles_dir=app._PROFILES_DIR, device="cpu")
+        assert update["choices"] == ["小明", "小红"] and update["value"] == "小明"
+
+    def test_save_without_sing_sample_hints(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(app, "save_profile",
+                            lambda n, s, g, profiles_dir="profiles", device="cpu": tmp_path / "x.npy")
+        monkeypatch.setattr(app, "list_profiles", lambda d: ["小明"])
+        msg, _ = app.save_streamer_profile("小明", "/tmp/a.wav", None, "CPU")
+        assert "唱歌样本" in msg
+
+    def test_save_voiceprint_error_readable(self, monkeypatch):
+        def boom(*a, **kw):
+            raise VoiceprintError("声纹样本几乎为静音")
+
+        monkeypatch.setattr(app, "save_profile", boom)
+        msg, _ = app.save_streamer_profile("小明", "/tmp/a.wav", None, "CPU")
+        assert "声纹保存失败" in msg and "静音" in msg
+
+    def test_save_unexpected_error_caught(self, monkeypatch):
+        def boom(*a, **kw):
+            raise RuntimeError("模型下载失败")
+
+        monkeypatch.setattr(app, "save_profile", boom)
+        msg, _ = app.save_streamer_profile("小明", "/tmp/a.wav", None, "CPU")
+        assert "未预期的错误" in msg
+
+    def test_auto_device_resolved_from_env(self, monkeypatch):
+        calls = {}
+
+        class FakeEnv:
+            device = "cuda"
+
+        monkeypatch.setattr(app, "detect_env", lambda: FakeEnv())
+
+        def fake_save(name, speak, sing, profiles_dir="profiles", device="cpu"):
+            calls["device"] = device
+            return "x.npy"
+
+        monkeypatch.setattr(app, "save_profile", fake_save)
+        monkeypatch.setattr(app, "list_profiles", lambda d: [])
+        app.save_streamer_profile("小明", "/tmp/a.wav", None, "自动")
+        assert calls["device"] == "cuda"
+
+    def test_refresh_updates_choices(self, monkeypatch):
+        monkeypatch.setattr(app, "list_profiles", lambda d: ["小明"])
+        update = app.refresh_profile_list()
+        assert update["choices"] == ["小明"]
+
+
+class TestStartTaskValidation:
+    def _run(self, **kw):
+        args = dict(
+            file="x.mp4", lyrics="", device="自动", model_size="small",
+            enable_separation=False, language="自动", formats=["srt"], title="",
+            enable_voiceprint=False, profile_name="", voice_threshold=0.55,
+            enable_song_detect=False, progress=lambda *a, **k: None,
+        )
+        args.update(kw)
+        return list(app.start_task(**args))
+
+    def test_missing_file_rejected(self):
+        outputs = self._run(file=None)
+        assert len(outputs) == 1 and "请先上传" in outputs[0][0]
+
+    def test_voiceprint_without_profile_rejected(self):
+        outputs = self._run(enable_voiceprint=True, profile_name="  ")
+        assert len(outputs) == 1
+        assert "未选择主播" in outputs[0][0]
+        # 任务未启动：未占用任务锁
+        assert app._task_lock.acquire(blocking=False)
+        app._task_lock.release()
 
 
 class TestPreload:

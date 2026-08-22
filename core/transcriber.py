@@ -91,14 +91,28 @@ class Transcriber:
         self.on_progress = on_progress
         self.cancel_event = cancel_event
 
-    def transcribe(self, path: str, total_duration: Optional[float] = None) -> list[SubtitleLine]:
-        """转写音频，返回行列表。OOM 时沿降档链自动降级重试。"""
+    def transcribe(
+        self,
+        path: str,
+        total_duration: Optional[float] = None,
+        clip_timestamps: Optional[list[tuple[float, float]]] = None,
+    ) -> list[SubtitleLine]:
+        """转写音频，返回行列表。OOM 时沿降档链自动降级重试。
+
+        clip_timestamps：仅转写指定区域（秒，全局时间轴，时间戳不受影响），
+        None 表示整段转写。用于声纹过滤后的定向转写。
+        """
         self._check_cancel()
+        clips: Optional[list[float]] = None
+        if clip_timestamps is not None:
+            clips = [float(t) for region in clip_timestamps for t in region]
+            if not clips:
+                return []
         last_oom: BaseException | None = None
         for device, compute_type in self._fallback_chain():
             try:
                 model = _get_model(self.model_size, device, compute_type)
-                segments = self._decode(model, device, path)
+                segments = self._decode(model, device, path, clips)
                 return self._collect(segments, total_duration)
             except Exception as exc:
                 if not _is_oom(exc):
@@ -110,7 +124,7 @@ class Transcriber:
             "请减小模型尺寸或改用 CPU 模式"
         ) from last_oom
 
-    def _decode(self, model, device: str, path: str):
+    def _decode(self, model, device: str, path: str, clips: Optional[list[float]] = None):
         """解码入口：GPU 优先批处理流水线（2~4x），OOM 或不可用退回逐段解码。"""
         kwargs = {
             "language": None if self.language in (None, "auto") else self.language,
@@ -120,6 +134,8 @@ class Transcriber:
             # 不携带上文 kv cache：长音频提速 10~20%，且显著减少重复幻觉
             "condition_on_previous_text": False,
         }
+        if clips is not None:
+            kwargs["clip_timestamps"] = clips
         if device == "cuda":
             batched = _get_batched_pipeline(model)
             if batched is not None:
