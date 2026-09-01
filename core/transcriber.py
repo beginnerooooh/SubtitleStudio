@@ -13,6 +13,9 @@ _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 # GPU 批处理推理的批大小（int8_float16 small/medium 在 4GB 显存下的安全值）
 _BATCH_SIZE = 8
 
+# whisper 段平均 logprob 低于此值 → 行标注低置信度（经验值，供人工复核）
+LOW_LOGPROB = -0.8
+
 
 class TranscriptionError(RuntimeError):
     """盲识别失败（含所有量化档位均 OOM）。"""
@@ -188,7 +191,13 @@ class Transcriber:
                 prev_end = end
             if not words:
                 continue
-            lines.append(SubtitleLine(words=words))
+            logprob = getattr(seg, "avg_logprob", None)
+            low_conf = logprob is not None and float(logprob) < LOW_LOGPROB
+            lines.append(SubtitleLine(
+                words=words,
+                low_confidence=low_conf,
+                low_confidence_reason="识别置信度低" if low_conf else "",
+            ))
             if total_duration and self.on_progress:
                 self.on_progress(min(1.0, seg.end / total_duration))
         return lines

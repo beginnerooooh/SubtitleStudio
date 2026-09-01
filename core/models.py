@@ -18,6 +18,9 @@ class SubtitleLine:
     """行级单元，由词聚合而来；start/end/text 均由 words 推导。"""
 
     words: list[SubtitleWord] = field(default_factory=list)
+    speaker: str = ""                 # 说话人名（多声纹模式后处理填充）
+    low_confidence: bool = False      # 置信度标注：供人工复核
+    low_confidence_reason: str = ""   # 标注原因（识别置信度低 / 说话人归属不确定）
 
     @property
     def start(self) -> float:

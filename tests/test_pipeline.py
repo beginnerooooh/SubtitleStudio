@@ -8,9 +8,11 @@ import core.pipeline as pl
 from core.aligner import AlignmentError, AlignResult
 from core.env import EnvInfo
 from core.errors import TaskCancelled
+from core.lyrics_fetcher import LyricTrack
 from core.models import SubtitleLine, SubtitleWord
 from core.pipeline import Pipeline, PipelineConfig, PipelineError
 from core.song_recognizer import SongEntry
+from core.speaker import SpeakerAnalysis, SpeakerAssignment, SpeakerCluster
 from core.text import prepare_lyrics
 from core.transcriber import TranscriptionError
 from core.voiceprint import SegmentVerdict, VoiceProfile, VoiceprintError
@@ -446,6 +448,80 @@ class TestSongDetect:
         assert [ln.text for ln in result.lines] == ["你好世界"]
 
 
+class TestLyricsFetch:
+    LRC = "[00:00.50]第一行\n[00:02.00]第二行\n[00:04.00]第三行"
+
+    def _cfg(self, tmp_path, **kw):
+        return PipelineConfig(
+            input_path=_make_input(tmp_path), work_dir=str(tmp_path / "out"),
+            enable_song_detect=True, enable_lyrics_fetch=True, **kw,
+        )
+
+    def _fake_fetch(self, monkeypatch, tracks):
+        monkeypatch.setattr(pl, "fetch_lyrics",
+                            lambda title, artist="": tracks.get(title))
+
+    def test_lyrics_lines_merge_and_span_removed(self, fakes, tmp_path, monkeypatch):
+        fakes["vad_segments"] = [(0.0, 40.0), (50.0, 60.0)]
+        fakes["song_entries"] = [SongEntry(
+            0.0, 40.0, "晴天", "周杰伦", confidence=98.0)]
+        self._fake_fetch(monkeypatch, {
+            "晴天": LyricTrack("晴天", "周杰伦", synced=self.LRC)})
+        logs = []
+        result = Pipeline(self._cfg(tmp_path), on_log=logs.append).run()
+        # 已配歌词的演唱块剔出转写区域（与 v1.0 识曲剔除一致）
+        assert fakes["transcriber_clips"] == [(49.75, 60.25)]
+        # 歌词行与转写行按时间轴合并
+        texts = [ln.text for ln in result.lines]
+        assert "你好世界" in texts and "第一行" in texts and "第三行" in texts
+        lyric = next(ln for ln in result.lines if ln.text == "第一行")
+        assert lyric.start == pytest.approx(0.5) and lyric.end == pytest.approx(2.0)
+        # 提示歌词按块起点对齐
+        assert any("整体偏移" in w for w in result.warnings)
+        assert any("已获取同步歌词" in m for m in logs)
+
+    def test_fetch_fail_keeps_transcription_fallback(self, fakes, tmp_path, monkeypatch):
+        fakes["vad_segments"] = [(0.0, 40.0)]
+        fakes["song_entries"] = [SongEntry(0.0, 40.0, "晴天", "周杰伦", 98.0)]
+        self._fake_fetch(monkeypatch, {})  # 拉取失败 → None
+        result = Pipeline(self._cfg(tmp_path)).run()
+        # 未拿到歌词的演唱块保留转写兜底
+        assert fakes["transcriber_clips"] == [(0.0, 40.25)]
+        assert any("未找到同步歌词" in w for w in result.warnings)
+        assert [ln.text for ln in result.lines] == ["你好世界"]
+
+    def test_all_regions_covered_skips_transcription(self, fakes, tmp_path, monkeypatch):
+        fakes["vad_segments"] = [(0.0, 40.0)]
+        fakes["song_entries"] = [SongEntry(0.0, 40.0, "晴天", "周杰伦", 98.0)]
+        self._fake_fetch(monkeypatch, {
+            "晴天": LyricTrack("晴天", "周杰伦", synced=self.LRC)})
+        result = Pipeline(self._cfg(tmp_path)).run()
+        # 全部区域被歌词覆盖 → 跳过转写，字幕只剩歌词行
+        assert fakes["transcriber_path"] is None
+        assert [ln.text for ln in result.lines] == ["第一行", "第二行", "第三行"]
+
+    def test_plain_only_track_not_used_for_lines(self, fakes, tmp_path, monkeypatch):
+        fakes["vad_segments"] = [(0.0, 40.0)]
+        fakes["song_entries"] = [SongEntry(0.0, 40.0, "晴天", "周杰伦", 98.0)]
+        self._fake_fetch(monkeypatch, {
+            "晴天": LyricTrack("晴天", "周杰伦", plain="纯文本")})  # 无 synced
+        result = Pipeline(self._cfg(tmp_path)).run()
+        assert fakes["transcriber_clips"] == [(0.0, 40.25)]  # 保留转写
+        assert [ln.text for ln in result.lines] == ["你好世界"]
+
+    def test_fetch_disabled_keeps_v1_behavior(self, fakes, tmp_path):
+        # enable_lyrics_fetch=False：识别到即剔除（不拉歌词）
+        fakes["vad_segments"] = [(0.0, 40.0), (50.0, 60.0)]
+        fakes["song_entries"] = [SongEntry(0.0, 40.0, "晴天", "周杰伦", 98.0)]
+        cfg = PipelineConfig(
+            input_path=_make_input(tmp_path), work_dir=str(tmp_path / "out"),
+            enable_song_detect=True,
+        )
+        result = Pipeline(cfg).run()
+        assert fakes["transcriber_clips"] == [(49.75, 60.25)]
+        assert result.songs[0].lyrics_lrc is None
+
+
 class TestLiveModeGuards:
     def test_align_mode_skips_live_features_with_warning(self, fakes, tmp_path):
         logs = []
@@ -463,3 +539,110 @@ class TestLiveModeGuards:
         assert fakes["song_blocks"] is None
         # 对齐模式不导出歌单文件
         assert "songs_md" not in result.files and "songs_csv" not in result.files
+
+
+def _mk_analysis(names, separated=False):
+    """构造与 fakes 的 VAD 段 (0,5)/(20,30) 对齐的多说话人分析结果。"""
+    segs = [(0.0, 5.0), (20.0, 30.0)]
+    clusters = [
+        SpeakerCluster(speaker_id=i + 1, name=n,
+                       embedding=np.ones(4, dtype=np.float32),
+                       matched_library=False, library_sim=0.0,
+                       segments=[segs[i]], duration=segs[i][1] - segs[i][0])
+        for i, n in enumerate(names)
+    ]
+    assignments = [
+        SpeakerAssignment(start=s, end=e, speaker_id=i + 1,
+                           confidence=0.95, ambiguous=False)
+        for i, (s, e) in enumerate(segs)
+    ]
+    return SpeakerAnalysis(clusters=clusters, assignments=assignments,
+                           separated=separated)
+
+
+def _fake_speaker_analyzer(monkeypatch, analysis):
+    """注入 SpeakerAnalyzer 假件；记录 analyze 调用参数。"""
+    calls = {"analyze": 0}
+
+    class FakeSpeakerAnalyzer:
+        def __init__(self, device="cpu"):
+            calls["device"] = device
+
+        def analyze(self, wav_path, segments, profiles_dir="profiles",
+                    use_library=True, separated=False, on_progress=None):
+            calls.update(analyze=calls["analyze"] + 1, wav_path=wav_path,
+                        segments=list(segments), separated=separated,
+                        use_library=use_library)
+            if on_progress:
+                on_progress(1.0)
+            return analysis
+
+    monkeypatch.setattr(pl, "SpeakerAnalyzer", FakeSpeakerAnalyzer)
+    return calls
+
+
+class TestMultiSpeaker:
+    """多说话人模式：预分析复用 / BGM 分离不匹配时重做 / 勾选过滤。"""
+
+    def test_preanalysis_reused_when_separated_matches(self, fakes, monkeypatch, tmp_path):
+        """预分析已含分离且任务开分离 → 直接复用（不重复嵌入/聚类）。"""
+        pre = _mk_analysis(["甲", "乙"], separated=True)
+        calls = _fake_speaker_analyzer(monkeypatch, pre)
+        cfg = PipelineConfig(
+            input_path=_make_input(tmp_path), work_dir=str(tmp_path / "out"),
+            speaker_mode="multi", enable_separation=True,
+            speaker_analysis=pre, selected_speakers=["甲"],
+        )
+        result = Pipeline(cfg).run()
+        assert calls["analyze"] == 0                    # 未重复分析
+        assert [ln.speaker for ln in result.lines] == ["甲"]   # 勾选过滤生效
+        # 乙的段 (20,30) 被剔除 → 转写区域只含 (0,5) 附近
+        assert fakes["transcriber_clips"] is not None
+        assert all(e <= 6.0 for _, e in fakes["transcriber_clips"])
+
+    def test_preanalysis_redone_on_separation_mismatch(self, fakes, monkeypatch, tmp_path):
+        """任务开分离但预分析在混音上做（带 BGM 直播回放）→ 在纯人声上重做。"""
+        pre = _mk_analysis(["甲", "乙"], separated=False)
+        redone = _mk_analysis(["甲", "乙"], separated=True)
+        calls = _fake_speaker_analyzer(monkeypatch, redone)
+        logs = []
+        cfg = PipelineConfig(
+            input_path=_make_input(tmp_path), work_dir=str(tmp_path / "out"),
+            speaker_mode="multi", enable_separation=True,
+            speaker_analysis=pre, selected_speakers=["甲"],
+        )
+        result = Pipeline(cfg, on_log=logs.append).run()
+        assert calls["analyze"] == 1                    # 丢弃污染预分析并重做
+        assert calls["wav_path"] == fakes["vocals"]     # 在分离后的人声上分析
+        assert calls["separated"] is True
+        assert any("重新识别说话人" in m for m in logs)
+        assert [ln.speaker for ln in result.lines] == ["甲"]   # 勾选按名字映射到新簇
+
+    def test_preanalysis_reused_without_task_separation(self, fakes, monkeypatch, tmp_path):
+        """任务未开分离 → 混音预分析也直接复用（用户显式选择，保持原行为）。"""
+        pre = _mk_analysis(["甲", "乙"], separated=False)
+        calls = _fake_speaker_analyzer(monkeypatch, pre)
+        cfg = PipelineConfig(
+            input_path=_make_input(tmp_path), work_dir=str(tmp_path / "out"),
+            speaker_mode="multi",
+            speaker_analysis=pre, selected_speakers=["甲"],
+        )
+        Pipeline(cfg).run()
+        assert calls["analyze"] == 0
+
+    def test_internal_analysis_marks_separated(self, fakes, monkeypatch, tmp_path):
+        """默认处理（未预分析）+ 开分离 → 内部分析在纯人声上且标记来源。"""
+        fresh = _mk_analysis(["甲", "乙"], separated=True)
+        calls = _fake_speaker_analyzer(monkeypatch, fresh)
+        cfg = PipelineConfig(
+            input_path=_make_input(tmp_path), work_dir=str(tmp_path / "out"),
+            speaker_mode="multi", enable_separation=True,
+        )
+        result = Pipeline(cfg).run()
+        assert calls["analyze"] == 1
+        assert calls["wav_path"] == fakes["vocals"]
+        assert calls["separated"] is True
+        # 未勾选 → 内部分析全选：两位说话人的段都进入转写
+        assert fakes["transcriber_clips"] is not None
+        assert any(e > 15.0 for _, e in fakes["transcriber_clips"])
+        assert result.speakers == fresh.clusters

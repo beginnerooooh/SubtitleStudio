@@ -75,8 +75,15 @@ def aggregate_words(
     return lines
 
 
-def to_srt(lines: list[SubtitleLine]) -> str:
-    """SubtitleLine[] → SRT 字符串。"""
+def _line_text(ln: SubtitleLine, speaker_labels: bool) -> str:
+    """行的显示文本；开启说话人标注时加「[名字] 」前缀。"""
+    if speaker_labels and ln.speaker:
+        return f"[{ln.speaker}] {ln.text}"
+    return ln.text
+
+
+def to_srt(lines: list[SubtitleLine], speaker_labels: bool = False) -> str:
+    """SubtitleLine[] → SRT 字符串（speaker_labels：行首标注 [说话人]）。"""
     blocks: list[str] = []
     n = 0
     for ln in lines:
@@ -84,18 +91,20 @@ def to_srt(lines: list[SubtitleLine]) -> str:
             continue
         n += 1
         blocks.append(
-            f"{n}\n{format_srt_time(ln.start)} --> {format_srt_time(ln.end)}\n{ln.text}"
+            f"{n}\n{format_srt_time(ln.start)} --> {format_srt_time(ln.end)}\n"
+            f"{_line_text(ln, speaker_labels)}"
         )
     return "\n\n".join(blocks) + "\n" if blocks else ""
 
 
-def to_lrc(lines: list[SubtitleLine], title: str = "") -> str:
+def to_lrc(lines: list[SubtitleLine], title: str = "",
+            speaker_labels: bool = False) -> str:
     """SubtitleLine[] → LRC 字符串（行级时间 + 元标签）；无有效行返回空串。"""
     body: list[str] = []
     for ln in lines:
         if not ln.words:
             continue
-        body.append(f"[{format_lrc_time(ln.start)}]{ln.text}")
+        body.append(f"[{format_lrc_time(ln.start)}]{_line_text(ln, speaker_labels)}")
     if not body:
         return ""
     parts: list[str] = []
@@ -124,11 +133,13 @@ def to_ass(
     lines: list[SubtitleLine],
     max_extension: float = 1.0,
     extension_gap: float = 0.05,
+    speaker_labels: bool = False,
 ) -> str:
     """SubtitleLine[] → ASS（逐字 \\k 卡拉OK）字符串。
 
     末字延音：与下一行间隙 ≤ max_extension 时，行显示结束时间延伸到
     下一行开始前 extension_gap 秒，末字 \\k 覆盖到行尾。
+    speaker_labels：说话人写入 ASS Name 字段（播放器演员名轨）。
     """
     events: list[str] = []
     for i, ln in enumerate(lines):
@@ -145,9 +156,10 @@ def to_ass(
             k_end = line_end if j == len(ln.words) - 1 else word.end
             dur_cs = max(1, _cs(k_end) - _cs(word.start))
             text_parts.append(f"{{\\k{dur_cs}}}{word.text}")
+        actor = ln.speaker if speaker_labels and ln.speaker else ""
         events.append(
             f"Dialogue: 0,{format_ass_time(ln.start)},{format_ass_time(line_end)},"
-            f"Default,,0,0,0,,{''.join(text_parts)}"
+            f"Default,{actor},0,0,0,,{''.join(text_parts)}"
         )
     if not events:
         return ""

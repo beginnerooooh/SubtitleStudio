@@ -132,6 +132,9 @@ runtime\python.exe models\download_models.py --preset full
 
 ## 5. 编译安装包（Setup.exe）
 
+> **需要 Inno Setup 7+**（脚本使用 `SetupArchitecture=x64` 生成原生 64 位安装器，
+> 产物为 PE32+ x64 可执行文件；Inno Setup 6 无法编译本脚本）。
+
 ```bat
 packaging\build.bat --clean --installer
 ```
@@ -140,10 +143,101 @@ packaging\build.bat --clean --installer
 `ISCC.exe`；找不到时打印手动命令）。也可以单独编译：
 
 ```bat
-"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=1.0.0 packaging\installer.iss
+"C:\Program Files\Inno Setup 7\ISCC.exe" /DMyAppVersion=1.0.0 packaging\installer.iss
 ```
 
-产物：`dist\SubtitleStudio_Setup_v1.0.0.exe`（lzma2/ultra64 固实压缩）。
+产物：`dist\SubtitleStudio_Setup_v1.0.0.exe`（原生 x64，lzma2/ultra64 固实压缩）。
+
+### 5.1 Linux 交叉构建（推荐：NSIS，无需 Wine）
+
+`packaging/installer.nsi` 与 `installer.iss` 功能对等（中文向导、许可页、
+Program Files 默认目录、开始菜单/桌面快捷方式、VC++ 2015-2022 x64 运行库
+检测、控制面板卸载注册、卸载时询问是否保留用户数据）。区别仅在技术栈：
+NSIS 的 `makensis` 是**原生 Linux 程序**，不依赖 wine——在 CI 沙箱
+（常禁止执行 32 位 ELF，导致 wine 无法运行 Inno 的 ISCC）也能编译：
+
+```bash
+apt install -y nsis                       # Ubuntu 24.04 = NSIS 3.09
+makensis -DMyAppVersion=1.2.0 packaging/installer.nsi
+```
+
+产物：`dist/SubtitleStudio_Setup_v1.2.0.exe`（LZMA 固实压缩，约 5~10 分钟）。
+安装器向导流程与 Inno 版一致；对最终用户完全透明（7-Zip / Notepad++ 同款
+安装器技术）。`!insertmacro MUI_PAGE_STARTMENU` 支持勾选「不创建开始菜单
+文件夹」；桌面快捷方式为可选组件（默认不勾选），与 Inno 版 tasks 行为一致。
+
+> 升级安装：NSIS 版写入 `HKLM\Software\Subtitle Studio\InstallLocation`，
+> 重复安装时自动沿用旧目录（与 Inno AppId 的升级识别目的相同）。
+
+### 5.2 Linux 交叉构建（备选：Wine + Inno Setup）
+
+`build_portable.py` 内置 `--wine` 模式：在 Linux 上用 Wine 执行 Embedded Python
+的 `pip install`（保证依赖的平台标记为 `win_amd64`），并用 Wine 中的 ISCC 编译
+Setup.exe。已在 Wine 11.15（WoW64 构建）+ Inno Setup 7.0.2 x64 上验证全流程
+（含静默安装与卸载冒烟测试）。
+
+一次性准备（root 或有 sudo 的 Linux）：
+
+```bash
+# 1) 安装 Wine（推荐 11.x 的 wow64 共享目录构建，32/64 位程序都能跑）
+#    本例解包到 /opt/wine-11.15-amd64-wow64；发行版自带的 winehq-stable 亦可
+apt install -y xvfb unzip          # 虚拟显示器 + 解包工具
+
+# 2) 创建专用 prefix（WOW64 模式：同时支持 x86 与 x64 PE）
+export WINEPREFIX=/root/.wine1115 WINEARCH=wow64 DISPLAY=:99
+Xvfb :99 &                          # Inno Setup 安装器需要 GUI
+wineboot -u
+
+# 3) 安装 Inno Setup 7 x64（官网 jrsoftware.org 下载 innosetup-7.x.x.exe）
+#    安装到 C:\InnoSetup7（find_iscc() 自动探测；也支持 C:\Program Files\*）
+#    注意：官方安装器本身是原生 x64 程序，可直接在 wine 下静默安装；
+#    但 Inno6 的 32 位安装器/及 32 位 setup 引导器在部分 wow64 wine 下会段错误，
+#    因此交叉构建必须用 Inno 7 的 x64 安装器 + SetupArchitecture=x64
+wine innosetup-7.0.2.exe /DIR=C:\\InnoSetup7 /VERYSILENT /SUPPRESSMSGBOXES
+```
+
+构建命令（在仓库根目录）：
+
+```bash
+export PATH=/opt/wine-11.15-amd64-wow64/bin:$PATH
+export WINEPREFIX=/root/.wine1115 WINEARCH=wow64 DISPLAY=:99 WINEDEBUG=-all
+
+# 完整构建 + 安装包（首次约需 30~60 分钟，视网络与压缩耗时）
+python3 packaging/build_portable.py --wine \
+    --wine-bin  /opt/wine-11.15-amd64-wow64/bin/wine \
+    --wine-prefix /root/.wine1115 \
+    --python-version 3.12.10 \
+    --python-mirror https://mirrors.huaweicloud.com/python \
+    --pip-mirror  https://pypi.tuna.tsinghua.edu.cn/simple \
+    --slim --installer
+
+# runtime 已就绪时只重打安装包（秒级，跳过依赖安装）
+python3 packaging/build_portable.py --wine \
+    --wine-bin /opt/wine-11.15-amd64-wow64/bin/wine \
+    --wine-prefix /root/.wine1115 \
+    --python-version 3.12.10 --skip-deps --ffmpeg btbn --installer
+```
+
+产物同样是 `dist/SubtitleStudio_Setup_v1.0.0.exe`，与 Windows 原生构建完全等价。
+
+**Wine 下的已知差异（仅影响交叉构建机，不影响最终用户）**：
+
+| 现象 | 说明 |
+|---|---|
+| 32 位 ELF `exec format error`（内核禁用 ia32） | 多数 CI 沙箱禁执行 32 位 ELF，wine 无法加载 32 位 PE（`syswow64\ntdll.dll` c0000135）。解决：改用 5.1 的 NSIS 路线，或自建完整 wow64 wine 环境 |
+| Inno 7 安装器提示「不支持当前 Windows 版本」 | wine 9 对 Win11 新 API 支持不全，即便注册表伪装 Build 26100 仍被拒。解决：升级 winehq-stable 11（注意 dl.winehq.org 走代理仅 ~20KB/s，122MB 需约 100 分钟），或改用 NSIS |
+| `OMP: Error #179 GetNumaNodeProcessorMaskEx() failed` | Wine 未实现该 syscall，libiomp 初始化即崩；冒烟测试时 `export KMP_AFFINITY=disabled` 绕过。真实 Windows 10/11 无此问题 |
+| `pip download --platform win_amd64` 平台标记错乱 | 这正是必须通过 Wine 里的 Windows Python 执行 `pip install` 的原因 |
+
+**交叉构建冒烟测试**（可选，验证便携目录可用性）：
+
+```bash
+cd dist/SubtitleStudio
+export KMP_AFFINITY=disabled HF_ENDPOINT=https://hf-mirror.com
+wine runtime\\python.exe launcher.py --debug    # 等待 "WebUI 就绪"
+curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:7860/   # 期望 200
+touch stop.flag                                   # 优雅停止，日志见 logs/app.log
+```
 
 ### 安装包行为要点
 
@@ -201,7 +295,8 @@ packaging\build.bat --clean --installer
 | `packaging/run.bat` | 用户双击入口（静默模式） |
 | `packaging/run-debug.bat` | 调试入口（控制台 + DEBUG 日志） |
 | `packaging/stop.bat` | 优雅停止（stop.flag 信号） |
-| `packaging/installer.iss` | Inno Setup 6 安装包脚本（中文向导/VC++ 检测/卸载保留数据） |
+| `packaging/installer.iss` | Inno Setup 7 安装包脚本（中文向导/VC++ 检测/卸载保留数据，Windows/wine 构建） |
+| `packaging/installer.nsi` | NSIS 等价脚本（Linux 原生 makensis 交叉构建，CI 沙箱友好） |
 | `packaging/version.txt` | 版本号唯一来源 |
 | `packaging/app.ico` | 应用图标（多尺寸） |
 | `packaging/LICENSE.txt` | EULA 模板（发布前替换） |

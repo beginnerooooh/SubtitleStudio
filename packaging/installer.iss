@@ -1,17 +1,17 @@
 ﻿; ============================================================================
-;  Subtitle Studio — Inno Setup 安装包脚本（Inno Setup 6.x）
+;  Subtitle Studio — Inno Setup 安装包脚本（需 Inno Setup 7+，见 SetupArchitecture）
 ;
 ;  编译（两种方式任选其一）：
 ;    1) Inno Setup Compiler 打开本文件，版本号默认取下方 #define
 ;    2) 命令行传入版本（build.bat --installer 自动调用）：
-;       iscc /DMyAppVersion=1.0.0 packaging\installer.iss
+;       iscc /DMyAppVersion=1.2.0 packaging\installer.iss
 ;
 ;  产物：dist\SubtitleStudio_Setup_v<版本>.exe
 ;  输入：..\dist\SubtitleStudio\*（先运行 build_portable.py 生成）
 ; ============================================================================
 
 #ifndef MyAppVersion
-  #define MyAppVersion "1.0.0"
+  #define MyAppVersion "1.2.0"
 #endif
 
 #define MyAppName "Subtitle Studio"
@@ -45,6 +45,9 @@ SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=admin
 ; 仅 64 位（PyTorch / CUDA 运行库均为 x64）
+; SetupArchitecture=x64（Inno Setup 7+）：生成原生 x64 安装器（PE32+），
+; 自带高熵 ASLR；同时使 Architectures* 默认 x64compatible
+SetupArchitecture=x64
 ArchitecturesInstallIn64BitMode=x64compatible
 ArchitecturesAllowed=x64compatible
 MinVersion=10.0
@@ -128,7 +131,7 @@ var
   Installed: Cardinal;
 begin
   Result :=
-    (not RegQueryDWordValue(HKEYLM,
+    (not RegQueryDWordValue(HKEY_LOCAL_MACHINE,
         'SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64',
         'Installed', Installed)) or (Installed <> 1);
 end;

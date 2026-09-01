@@ -19,17 +19,26 @@
     --python-mirror https://mirrors.huaweicloud.com/python
     --pip-mirror https://pypi.tuna.tsinghua.edu.cn/simple
     环境变量 HF_ENDPOINT=https://hf-mirror.com（模型下载）
+
+Linux 交叉构建（无 Windows 开发机时，通过 wine 执行 runtime 内的 python.exe）：
+    python3 packaging/build_portable.py --wine --slim \
+        --wine-prefix ~/.wine1115 \
+        --wine-bin /opt/wine-11.15-amd64-wow64/bin/wine \
+        --installer
 """
 from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import urllib.request
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -99,6 +108,58 @@ def run_command(cmd: list[str], **kw) -> subprocess.CompletedProcess:
         tail = (proc.stdout or "")[-2000:] + (proc.stderr or "")[-2000:]
         raise BuildError(f"命令失败（exit={proc.returncode}）：\n{tail}")
     return proc
+
+
+# ---------------- Wine 交叉构建（Linux 宿主） ----------------
+
+def to_windows_path(path: Path | str) -> str:
+    """Unix 路径 → wine 视角的 Windows 路径（Z: 盘映射根目录）。"""
+    s = str(path)
+    if re.match(r"^[A-Za-z]:[\\/]", s):  # 已是 Windows 路径
+        return s
+    return "Z:\\" + s.replace("/", "\\")
+
+
+@dataclass
+class WineCtx:
+    """wine 交叉执行上下文：把「Windows 命令」翻译为宿主命令行。"""
+    bin: str = "wine"
+    prefix: Path = Path.home() / ".wine"
+
+    def env(self, extra: dict[str, str] | None = None) -> dict[str, str]:
+        """构造 wine 子进程环境；extra 中的 Unix 路径值自动转换为 Z:\\ 形式。"""
+        env = {
+            **os.environ,
+            "WINEPREFIX": str(self.prefix),
+            "WINEDEBUG": "-all",
+            "WINEDLLOVERRIDES": "mscoree,mshtml=",
+        }
+        for k, v in (extra or {}).items():
+            env[k] = to_windows_path(v) if (v.startswith("/") and Path(v).exists()) else v
+        return env
+
+    def wrap(self, cmd: list, env_extra: dict[str, str] | None = None
+             ) -> tuple[list[str], dict[str, str]]:
+        """[exe, args...] → [wine, exe(Z:\\..), args...]；存在的 Unix 路径参数自动转换。"""
+        converted: list[str] = []
+        for i, c in enumerate(cmd):
+            s = str(c)
+            if i == 0 or (s.startswith("/") and Path(s).exists()):
+                converted.append(to_windows_path(s))
+            else:
+                converted.append(s)
+        return [self.bin, *converted], self.env(env_extra)
+
+    def find_iscc(self) -> str | None:
+        """在 wine prefix 中查找已安装的 Inno Setup 编译器（返回 Windows 路径）。"""
+        drive_c = self.prefix / "drive_c"
+        for sub in ("InnoSetup7", "Inno Setup 7", "InnoSetup6", "Inno Setup 6"):
+            for pf in ("", "Program Files/", "Program Files (x86)/"):
+                exe = drive_c / pf / sub / "ISCC.exe"
+                if exe.is_file():
+                    rel = exe.relative_to(drive_c).as_posix()
+                    return "C:\\" + rel.replace("/", "\\")
+        return None
 
 
 # ---------------- 源码复制（过滤缓存/测试/文档） ----------------
@@ -191,7 +252,7 @@ def setup_embedded_python(runtime: Path, version: str, mirror: str | None,
     log(f"已写入 {pth.name}（启用 site-packages 与 app/ 搜索路径）")
 
 
-def install_pip(runtime: Path, cache_dir: Path) -> None:
+def install_pip(runtime: Path, cache_dir: Path, wine: WineCtx | None = None) -> None:
     """Embedded Python 无 pip：get-pip.py 引导安装。"""
     if (runtime / "Lib" / "site-packages" / "pip").is_dir():
         log("pip 已存在（跳过安装）")
@@ -199,23 +260,37 @@ def install_pip(runtime: Path, cache_dir: Path) -> None:
     get_pip = cache_dir / "get-pip.py"
     if not get_pip.is_file():
         download_file(GET_PIP_URL, get_pip)
-    run_command([runtime / "python.exe", get_pip, "--no-warn-script-location"])
+    cmd = [runtime / "python.exe", get_pip, "--no-warn-script-location"]
+    if wine:
+        cmd, env = wine.wrap(cmd)
+        run_command(cmd, env=env)
+    else:
+        run_command(cmd)
 
 
 def install_dependencies(runtime: Path, requirements: Path,
-                          torch_index: str | None, pip_mirror: str | None) -> None:
+                          torch_index: str | None, pip_mirror: str | None,
+                          wine: WineCtx | None = None) -> None:
     """安装 requirements；GPU 模式先从 torch 官方源装 torch/torchaudio。"""
     py = runtime / "python.exe"
     base = [py, "-m", "pip", "install", "--no-cache-dir", "--no-warn-script-location"]
     if pip_mirror:
         base += ["-i", pip_mirror]
+
+    def _run(parts: list) -> None:
+        if wine:
+            cmd, env = wine.wrap(parts)
+            run_command(cmd, env=env)
+        else:
+            run_command(parts)
+
     if torch_index:
         # cuXXX wheel 版本号带本地段（如 2.5.1+cu124），先装即可满足 requirements 约束，
         # 第二步 pip 不会重复下载 PyPI 的 CPU 版
         log(f"安装 GPU 版 PyTorch（{torch_index}）…")
-        run_command(base + ["torch", "torchaudio", "--index-url", torch_index])
+        _run(base + ["torch", "torchaudio", "--index-url", torch_index])
     log("安装项目依赖（requirements.txt）…")
-    run_command(base + ["-r", requirements])
+    _run(base + ["-r", requirements])
 
 
 def slim_runtime(runtime: Path) -> None:
@@ -290,39 +365,54 @@ def fetch_ffmpeg(bin_dir: Path, source: str, cache_dir: Path) -> list[Path]:
 
 # ---------------- 模型预下载 ----------------
 
-def prefetch_models(dist: Path, preset: str) -> None:
+def prefetch_models(dist: Path, preset: str, wine: WineCtx | None = None) -> None:
     """调用 models/download_models.py 用便携 runtime 预热模型缓存。"""
-    script = dist / "models" / "download_models.py"
+    script = REPO / "models" / "download_models.py"
     if not script.is_file():
         raise BuildError(f"缺少模型下载脚本：{script}")
     env = {
-        **__import__("os").environ,
         "HF_HOME": str(dist / "models" / "hf"),
         "TORCH_HOME": str(dist / "models" / "torch"),
         "MODELSCOPE_CACHE": str(dist / "models" / "modelscope"),
     }
-    run_command([dist / "runtime" / "python.exe", script, "--preset", preset], env=env)
+    cmd = [dist / "runtime" / "python.exe", script, "--preset", preset]
+    if wine:
+        cmd, env = wine.wrap(cmd, env_extra=env)
+        run_command(cmd, env=env)
+    else:
+        run_command(cmd, env={**os.environ, **env})
 
 
 # ---------------- Inno Setup ----------------
 
-def compile_installer(version: str, dist_root: Path) -> Path:
+def compile_installer(version: str, dist_root: Path, wine: WineCtx | None = None) -> Path:
     """调用 Inno Setup 编译 Setup.exe（ISCC 不在 PATH 时给出指引）。"""
-    iscc = shutil.which("iscc") or shutil.which("ISCC")
-    if iscc is None:
-        for candidate in (
-            r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
-            r"C:\Program Files\Inno Setup 6\ISCC.exe",
-        ):
-            if Path(candidate).is_file():
-                iscc = candidate
-                break
-    if iscc is None:
-        raise BuildError(
-            "未找到 Inno Setup 编译器（ISCC.exe）。请安装 Inno Setup 6.x 后重试，"
-            "或手动执行：iscc /DMyAppVersion=" + version + " packaging\\installer.iss"
-        )
-    run_command([iscc, f"/DMyAppVersion={version}", str(PACKAGING / "installer.iss")])
+    if wine:
+        iscc = wine.find_iscc()
+        if iscc is None:
+            raise BuildError(
+                "wine prefix 中未找到 Inno Setup 编译器（ISCC.exe）。请先在 wine 下安装 "
+                "Inno Setup 6/7（例如安装到 C:\\InnoSetup7），或用 --wine-prefix 指定正确 prefix")
+        cmd = [wine.bin, iscc, f"/DMyAppVersion={version}",
+               to_windows_path(PACKAGING / "installer.iss")]
+        run_command(cmd, env=wine.env())
+    else:
+        iscc = shutil.which("iscc") or shutil.which("ISCC")
+        if iscc is None:
+            for candidate in (
+                r"C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+                r"C:\Program Files\Inno Setup 6\ISCC.exe",
+                r"C:\Program Files\Inno Setup 7\ISCC.exe",
+            ):
+                if Path(candidate).is_file():
+                    iscc = candidate
+                    break
+        if iscc is None:
+            raise BuildError(
+                "未找到 Inno Setup 编译器（ISCC.exe）。请安装 Inno Setup 6/7 后重试，"
+                "或手动执行：iscc /DMyAppVersion=" + version + " packaging\\installer.iss"
+            )
+        run_command([iscc, f"/DMyAppVersion={version}", str(PACKAGING / "installer.iss")])
     setup = dist_root.parent / f"SubtitleStudio_Setup_v{version}.exe"
     if not setup.is_file():
         raise BuildError(f"安装包未生成：{setup}")
@@ -332,12 +422,12 @@ def compile_installer(version: str, dist_root: Path) -> Path:
 
 # ---------------- 组装 ----------------
 
-def build_version_manifest(dist: Path, version: str) -> Path:
+def build_version_manifest(dist: Path, version: str, python_version: str) -> Path:
     path = dist / "version.txt"
     path.write_text(
         f"Subtitle Studio v{version}\n"
         f"built_at={_dt.datetime.now().isoformat(timespec='seconds')}\n"
-        f"python={sys.version.split()[0]}\n",
+        f"python={python_version} (embedded)\n",
         encoding="utf-8",
     )
     return path
@@ -366,12 +456,16 @@ def assemble(args: argparse.Namespace) -> Path:
         shutil.copy2(PACKAGING / "app.ico", dist / "app.ico")
 
     # 3. Embedded Python + 依赖
+    wine = None
+    if args.wine:
+        wine = WineCtx(bin=args.wine_bin, prefix=Path(args.wine_prefix).expanduser())
+        log(f"wine 交叉构建：bin={wine.bin} prefix={wine.prefix}")
     if not args.skip_deps:
         runtime = dist / "runtime"
         setup_embedded_python(runtime, args.python_version, args.python_mirror, cache_dir)
-        install_pip(runtime, cache_dir)
+        install_pip(runtime, cache_dir, wine=wine)
         install_dependencies(runtime, dist / "app" / "requirements.txt",
-                             args.torch_index, args.pip_mirror)
+                             args.torch_index, args.pip_mirror, wine=wine)
         if args.slim:
             slim_runtime(runtime)
     else:
@@ -382,10 +476,10 @@ def assemble(args: argparse.Namespace) -> Path:
 
     # 5. 模型预下载（可选：制作纯离线完整版）
     if args.with_models:
-        prefetch_models(dist, args.preset)
+        prefetch_models(dist, args.preset, wine=wine)
 
     # 6. 版本清单
-    build_version_manifest(dist, args.version)
+    build_version_manifest(dist, args.version, args.python_version)
     log(f"便携目录构建完成：{dist}")
     return dist
 
@@ -419,6 +513,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="预下载模型规格（配合 --with-models）")
     p.add_argument("--installer", action="store_true",
                    help="构建完成后调用 Inno Setup 编译 Setup.exe")
+    p.add_argument("--wine", action="store_true",
+                   help="Linux 交叉构建：通过 wine 执行 runtime 内的 python.exe 与 ISCC.exe")
+    p.add_argument("--wine-bin", default="wine",
+                   help="wine 可执行文件路径（默认取 PATH 中的 wine）")
+    p.add_argument("--wine-prefix",
+                   default=os.environ.get("WINEPREFIX", str(Path.home() / ".wine")),
+                   help="WINEPREFIX 路径（默认读环境变量 WINEPREFIX）")
     return p.parse_args(argv)
 
 
@@ -434,7 +535,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         dist = assemble(args)
         if args.installer:
-            compile_installer(args.version, dist)
+            wine = WineCtx(bin=args.wine_bin,
+                           prefix=Path(args.wine_prefix).expanduser()) if args.wine else None
+            compile_installer(args.version, dist, wine=wine)
     except BuildError as exc:
         print(f"\n[build] 构建失败：{exc}", file=sys.stderr)
         return 1

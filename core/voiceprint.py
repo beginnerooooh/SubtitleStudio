@@ -332,6 +332,27 @@ def load_profile(name: str, profiles_dir: str | Path = "profiles") -> VoiceProfi
         raise VoiceprintError(f"声纹 Profile 损坏：{path}") from exc
 
 
+def save_library_speaker(
+    name: str,
+    embedding: np.ndarray,
+    profiles_dir: str | Path = "profiles",
+) -> Path:
+    """把已发现的说话人声纹（簇中心 embedding）直接存入声纹库。
+
+    用于说话人分离流程：用户试听验证后命名入库，后续文件即可自动匹配。
+    """
+    name = _validate_name(name)
+    emb = np.asarray(embedding, dtype=np.float32)
+    if emb.ndim != 1 or emb.size == 0:
+        raise VoiceprintError("声纹向量无效（需一维非空数组）")
+    emb = _normalize(emb)
+    out_dir = Path(profiles_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{name}.npy"
+    np.save(path, {"name": name, "speak": emb, "sing": None})
+    return path
+
+
 def list_profiles(profiles_dir: str | Path = "profiles") -> list[str]:
     """已注册主播名列表（文件名去掉 .npy）。"""
     d = Path(profiles_dir)
