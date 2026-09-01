@@ -170,3 +170,45 @@ class TestToAss:
 
     def test_empty_lines_input(self):
         assert to_ass([]) == ""
+
+
+class TestLowConfidenceExport:
+    """低置信度行导出可视化：SRT/LRC ⚠ 前缀、ASS LowConf 样式（开关两态）。"""
+
+    def _lines(self):
+        ok = SubtitleLine(words=[w("正常", 0.0, 0.5)])
+        bad = SubtitleLine(words=[w("待复核", 1.0, 1.5)])
+        bad.low_confidence = True
+        bad.low_confidence_reason = "识别置信度低"
+        return [ok, bad]
+
+    def test_srt_marked_when_enabled(self):
+        srt = to_srt(self._lines(), mark_low_confidence=True)
+        assert "\u26a0 待复核" in srt          # 低置信度行有 ⚠ 前缀
+        assert "正常" in srt and "\u26a0 正常" not in srt  # 正常行不受影响
+
+    def test_srt_unmarked_when_disabled(self):
+        srt = to_srt(self._lines())            # 默认关闭：与旧行为一致
+        assert "\u26a0" not in srt
+
+    def test_lrc_marked_when_enabled(self):
+        lrc = to_lrc(self._lines(), mark_low_confidence=True)
+        assert "\u26a0 待复核" in lrc
+        assert "]正常" in lrc                   # 正常行无标记
+
+    def test_ass_lowconf_style_when_enabled(self):
+        ass = to_ass(self._lines(), mark_low_confidence=True)
+        assert "Style: LowConf," in ass         # header 定义了样式
+        assert ",LowConf," in ass               # 低置信度行走该样式
+        assert ",Default," in ass               # 正常行仍走 Default
+
+    def test_ass_no_lowconf_style_when_disabled(self):
+        ass = to_ass(self._lines())
+        assert ",LowConf," not in ass            # 事件不使用 LowConf 样式
+
+    def test_srt_prefix_order_with_speaker(self):
+        bad = SubtitleLine(words=[w("内容", 0.0, 0.5)], speaker="小明")
+        bad.low_confidence = True
+        srt = to_srt([bad], speaker_labels=True, mark_low_confidence=True)
+        # 标记在说话人前：⚠ [小明] 内容
+        assert "\u26a0 [小明] 内容" in srt

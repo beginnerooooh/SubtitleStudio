@@ -75,15 +75,32 @@ def aggregate_words(
     return lines
 
 
-def _line_text(ln: SubtitleLine, speaker_labels: bool) -> str:
-    """行的显示文本；开启说话人标注时加「[名字] 」前缀。"""
+# 低置信度行前缀：纯文本格式（SRT/LRC）的复核标记
+_LOW_CONF_MARK = "\u26a0 "
+
+
+def _line_text(ln: SubtitleLine, speaker_labels: bool,
+               mark_low_confidence: bool = False) -> str:
+    """行的显示文本。
+
+    speaker_labels：加「[名字] 」前缀；
+    mark_low_confidence：低置信度行加「⚠ 」前缀（供人工复核定位）。
+    """
+    prefix = ""
+    if mark_low_confidence and ln.low_confidence:
+        prefix += _LOW_CONF_MARK
     if speaker_labels and ln.speaker:
-        return f"[{ln.speaker}] {ln.text}"
-    return ln.text
+        prefix += f"[{ln.speaker}] "
+    return prefix + ln.text
 
 
-def to_srt(lines: list[SubtitleLine], speaker_labels: bool = False) -> str:
-    """SubtitleLine[] → SRT 字符串（speaker_labels：行首标注 [说话人]）。"""
+def to_srt(lines: list[SubtitleLine], speaker_labels: bool = False,
+           mark_low_confidence: bool = False) -> str:
+    """SubtitleLine[] → SRT 字符串。
+
+    speaker_labels：行首标注 [说话人]；
+    mark_low_confidence：低置信度行加 ⚠ 前缀。
+    """
     blocks: list[str] = []
     n = 0
     for ln in lines:
@@ -92,19 +109,22 @@ def to_srt(lines: list[SubtitleLine], speaker_labels: bool = False) -> str:
         n += 1
         blocks.append(
             f"{n}\n{format_srt_time(ln.start)} --> {format_srt_time(ln.end)}\n"
-            f"{_line_text(ln, speaker_labels)}"
+            f"{_line_text(ln, speaker_labels, mark_low_confidence)}"
         )
     return "\n\n".join(blocks) + "\n" if blocks else ""
 
 
 def to_lrc(lines: list[SubtitleLine], title: str = "",
-            speaker_labels: bool = False) -> str:
+            speaker_labels: bool = False,
+            mark_low_confidence: bool = False) -> str:
     """SubtitleLine[] → LRC 字符串（行级时间 + 元标签）；无有效行返回空串。"""
     body: list[str] = []
     for ln in lines:
         if not ln.words:
             continue
-        body.append(f"[{format_lrc_time(ln.start)}]{_line_text(ln, speaker_labels)}")
+        body.append(
+            f"[{format_lrc_time(ln.start)}]"
+            f"{_line_text(ln, speaker_labels, mark_low_confidence)}")
     if not body:
         return ""
     parts: list[str] = []
@@ -123,6 +143,7 @@ WrapStyle: 0
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Default,Microsoft YaHei,90,&H00FFFFFF,&H0000FFFF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,3,0,2,20,20,60,1
+Style: LowConf,Microsoft YaHei,90,&H0000A5FF,&H0000FFFF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,3,0,2,20,20,60,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -134,12 +155,15 @@ def to_ass(
     max_extension: float = 1.0,
     extension_gap: float = 0.05,
     speaker_labels: bool = False,
+    mark_low_confidence: bool = False,
 ) -> str:
     """SubtitleLine[] → ASS（逐字 \\k 卡拉OK）字符串。
 
     末字延音：与下一行间隙 ≤ max_extension 时，行显示结束时间延伸到
     下一行开始前 extension_gap 秒，末字 \\k 覆盖到行尾。
-    speaker_labels：说话人写入 ASS Name 字段（播放器演员名轨）。
+    speaker_labels：说话人写入 ASS Name 字段（播放器演员名轨）；
+    mark_low_confidence：低置信度行走 LowConf 样式（橙色主色，播放中
+    一眼可辨），卡拉OK节奏不受影响。
     """
     events: list[str] = []
     for i, ln in enumerate(lines):
@@ -157,9 +181,11 @@ def to_ass(
             dur_cs = max(1, _cs(k_end) - _cs(word.start))
             text_parts.append(f"{{\\k{dur_cs}}}{word.text}")
         actor = ln.speaker if speaker_labels and ln.speaker else ""
+        style = ("LowConf" if mark_low_confidence and ln.low_confidence
+                 else "Default")
         events.append(
             f"Dialogue: 0,{format_ass_time(ln.start)},{format_ass_time(line_end)},"
-            f"Default,{actor},0,0,0,,{''.join(text_parts)}"
+            f"{style},{actor},0,0,0,,{''.join(text_parts)}"
         )
     if not events:
         return ""

@@ -541,10 +541,13 @@ class Pipeline:
         stem = Path(cfg.input_path).stem
         title = cfg.title or stem
         writers = {
-            "srt": lambda ls: to_srt(ls, speaker_labels=cfg.speaker_labels),
+            "srt": lambda ls: to_srt(ls, speaker_labels=cfg.speaker_labels,
+                                     mark_low_confidence=cfg.mark_low_confidence),
             "lrc": lambda ls: to_lrc(ls, title=title,
-                                     speaker_labels=cfg.speaker_labels),
-            "ass": lambda ls: to_ass(ls, speaker_labels=cfg.speaker_labels),
+                                     speaker_labels=cfg.speaker_labels,
+                                     mark_low_confidence=cfg.mark_low_confidence),
+            "ass": lambda ls: to_ass(ls, speaker_labels=cfg.speaker_labels,
+                                     mark_low_confidence=cfg.mark_low_confidence),
         }
         files: dict[str, str] = {}
         fmts = [f for f in cfg.formats if f in writers]
