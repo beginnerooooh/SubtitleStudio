@@ -27,7 +27,9 @@ from core.speaker import SpeakerAnalyzer, SpeakerError
 from core.song_recognizer import format_timeline_md
 from core.voiceprint import (
     VoiceprintError,
+    delete_profile,
     list_profiles,
+    rename_profile,
     save_library_speaker,
     save_profile,
     speech_intervals,
@@ -298,6 +300,48 @@ def refresh_profile_list():
     return gr.update(choices=_profile_choices())
 
 
+def delete_streamer_profile(name, current_profile):
+    """从声纹库删除指定 Profile；返回状态与两个下拉框的刷新。"""
+    if not name:
+        return "请先在下拉框选择要删除的声纹。", gr.update(), gr.update()
+    try:
+        path = delete_profile(name, profiles_dir=_PROFILES_DIR)
+    except VoiceprintError as exc:
+        return f"删除失败：{exc}", gr.update(), gr.update()
+    except Exception as exc:  # 兜底：文件被占用等
+        return f"未预期的错误：{exc!r}", gr.update(), gr.update()
+    choices = _profile_choices()
+    # 当前选中的 Profile 被删时清空选择，避免残留失效值
+    remain = None if current_profile == name else current_profile
+    return (
+        f"已删除「{name}」的声纹（{path}）。",
+        gr.update(choices=choices, value=remain),
+        gr.update(choices=choices, value=None),
+    )
+
+
+def rename_streamer_profile(old, new, current_profile):
+    """重命名声纹库中的 Profile；返回状态与两个下拉框的刷新。"""
+    if not old:
+        return "请先在下拉框选择要重命名的声纹。", gr.update(), gr.update()
+    if not (new or "").strip():
+        return "请输入新名称。", gr.update(), gr.update()
+    try:
+        path = rename_profile(old, new.strip(), profiles_dir=_PROFILES_DIR)
+    except VoiceprintError as exc:
+        return f"重命名失败：{exc}", gr.update(), gr.update()
+    except Exception as exc:  # 兜底：磁盘写入失败等
+        return f"未预期的错误：{exc!r}", gr.update(), gr.update()
+    choices = _profile_choices()
+    # 当前选中的正是被改名者 → 跟随新名字
+    follow = new.strip() if current_profile == old else current_profile
+    return (
+        f"已将「{old}」重命名为「{new.strip()}」（{path}）。",
+        gr.update(choices=choices, value=follow),
+        gr.update(choices=choices, value=new.strip()),
+    )
+
+
 # ---------------- 多说话人分离 ----------------
 
 def _speaker_panels(mode_label):
@@ -474,6 +518,26 @@ def build_ui() -> gr.Blocks:
                             save_profile_btn = gr.Button("提取并保存声纹")
                             profile_status_out = gr.Markdown()
 
+                        with gr.Accordion("管理声纹库", open=False):
+                            gr.Markdown(
+                                "删除或重命名已入库的声纹（含主播 Profile 与"
+                                "「加入声纹库」的说话人）。"
+                            )
+                            manage_profile_in = gr.Dropdown(
+                                choices=_profile_choices(),
+                                label="选择声纹", scale=3,
+                            )
+                            with gr.Row():
+                                manage_rename_in = gr.Textbox(
+                                    label="新名称", placeholder="重命名时填写",
+                                    scale=2,
+                                )
+                                rename_profile_btn = gr.Button("重命名", scale=1)
+                                delete_profile_btn = gr.Button(
+                                    "删除", variant="stop", scale=1,
+                                )
+                            manage_status_md = gr.Markdown()
+
                     with gr.Column(visible=False) as multi_panel:
                         gr.Markdown(
                             "自动分离文件中的各说话人（无需预注册）：先分析 → 试听验证 → "
@@ -572,6 +636,16 @@ def build_ui() -> gr.Blocks:
         example_btn.click(lambda: EXAMPLE_LYRICS, outputs=lyrics_in).then(_mode_hint, inputs=lyrics_in, outputs=mode_hint)
 
         refresh_profile_btn.click(refresh_profile_list, outputs=profile_in)
+        delete_profile_btn.click(
+            delete_streamer_profile,
+            inputs=[manage_profile_in, profile_in],
+            outputs=[manage_status_md, profile_in, manage_profile_in],
+        )
+        rename_profile_btn.click(
+            rename_streamer_profile,
+            inputs=[manage_profile_in, manage_rename_in, profile_in],
+            outputs=[manage_status_md, profile_in, manage_profile_in],
+        )
         save_profile_btn.click(
             save_streamer_profile,
             inputs=[new_name_in, speak_sample_in, sing_sample_in, device_in],

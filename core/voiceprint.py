@@ -369,3 +369,45 @@ def list_profiles(profiles_dir: str | Path = "profiles") -> list[str]:
     if not d.is_dir():
         return []
     return sorted(p.stem for p in d.glob("*.npy"))
+
+
+def delete_profile(name: str, profiles_dir: str | Path = "profiles") -> Path:
+    """删除已注册的声纹 Profile。"""
+    name = _validate_name(name)
+    path = Path(profiles_dir) / f"{name}.npy"
+    if not path.is_file():
+        raise VoiceprintError(f"未找到「{name}」的声纹（{path}）")
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise VoiceprintError(f"删除失败（文件被占用或无权限）：{path}") from exc
+    return path
+
+
+def rename_profile(
+    old: str,
+    new: str,
+    profiles_dir: str | Path = "profiles",
+) -> Path:
+    """重命名声纹 Profile（同步更新 .npy 内部 name 字段）。"""
+    old = _validate_name(old)
+    new = _validate_name(new)
+    src = Path(profiles_dir) / f"{old}.npy"
+    dst = Path(profiles_dir) / f"{new}.npy"
+    if not src.is_file():
+        raise VoiceprintError(f"未找到「{old}」的声纹（{src}）")
+    if dst.exists():
+        raise VoiceprintError(f"名称「{new}」已被占用，请换一个名字")
+    try:
+        data = np.load(src, allow_pickle=True).item()
+        data["name"] = new
+        np.save(dst, data)
+        src.unlink()
+    except VoiceprintError:
+        raise
+    except Exception as exc:
+        # 避免半途失败留下新旧两份：写坏的目标文件一并清理
+        if dst.exists() and not src.exists():
+            dst.unlink(missing_ok=True)
+        raise VoiceprintError(f"重命名失败（Profile 可能损坏）：{src}") from exc
+    return dst

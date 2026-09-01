@@ -11,9 +11,11 @@ from core.voiceprint import (
     VoiceProfile,
     VoiceprintEngine,
     VoiceprintError,
+    delete_profile,
     list_profiles,
     load_profile,
     merge_regions,
+    rename_profile,
     save_profile,
 )
 
@@ -309,3 +311,58 @@ class TestModelSeam:
         monkeypatch.setattr(vp, "_load_ecapa", boom)
         with pytest.raises(VoiceprintError, match="speechbrain"):
             VoiceprintEngine()._embed([np.zeros(16000, dtype=np.float32)])
+
+
+class TestProfileManagement:
+    """声纹库管理：删除/重命名（tmp_path + 接缝 mock）。"""
+
+    def _mk(self, tmp_path, name):
+        speak = _write_pattern_wav(tmp_path / f"{name}.wav", [[1, 0, 0, 0]])
+        return save_profile(name, speak, None, profiles_dir=tmp_path)
+
+    def test_delete_removes_file(self, tmp_path, fake_embed, passthrough_extract):
+        self._mk(tmp_path, "待删")
+        path = delete_profile("待删", profiles_dir=tmp_path)
+        assert path == tmp_path / "待删.npy"
+        assert path not in _files(tmp_path)
+        assert "待删" not in list_profiles(tmp_path)
+
+    def test_delete_missing_raises(self, tmp_path):
+        with pytest.raises(VoiceprintError, match="未找到"):
+            delete_profile("不存在", profiles_dir=tmp_path)
+
+    def test_rename_updates_name_field_and_file(
+        self, tmp_path, fake_embed, passthrough_extract,
+    ):
+        self._mk(tmp_path, "旧名")
+        dst = rename_profile("旧名", "新名", profiles_dir=tmp_path)
+        assert dst == tmp_path / "新名.npy"
+        assert not (tmp_path / "旧名.npy").exists()
+        p = load_profile("新名", profiles_dir=tmp_path)
+        assert p.name == "新名"  # 内部 name 字段同步更新
+        assert list_profiles(tmp_path) == ["新名"]
+
+    def test_rename_to_existing_name_raises(
+        self, tmp_path, fake_embed, passthrough_extract,
+    ):
+        self._mk(tmp_path, "甲")
+        self._mk(tmp_path, "乙")
+        with pytest.raises(VoiceprintError, match="已被占用"):
+            rename_profile("甲", "乙", profiles_dir=tmp_path)
+        # 源文件保留，目标未被动过
+        assert (tmp_path / "甲.npy").exists()
+
+    def test_rename_missing_source_raises(self, tmp_path):
+        with pytest.raises(VoiceprintError, match="未找到"):
+            rename_profile("不存在", "随便", profiles_dir=tmp_path)
+
+    def test_rename_invalid_new_name_raises(
+        self, tmp_path, fake_embed, passthrough_extract,
+    ):
+        self._mk(tmp_path, "好名")
+        with pytest.raises(VoiceprintError, match="非法字符"):
+            rename_profile("好名", "坏/名", profiles_dir=tmp_path)
+
+
+def _files(tmp_path):
+    return set(tmp_path.glob("*.npy"))
