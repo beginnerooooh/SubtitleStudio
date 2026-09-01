@@ -18,19 +18,30 @@ def fake_demucs(monkeypatch):
     state = {"fail_error": None, "constructed": []}
 
     class FakeSeparator:
-        def __init__(self, model="htdemucs", device="cpu", two_stems=None, callback=None, **kwargs):
-            self.model = types.SimpleNamespace(sources=["vocals", "no_vocals"])
+        """按 demucs 4.x api.Separator 真实接口 mock（dict 回调 / (原波形, 声部字典)）。"""
+
+        samplerate = 16000  # 真实模型为 44100；测试用 16k 免 resample
+
+        def __init__(self, model="htdemucs", device="cpu", progress=None,
+                     callback=None, **kwargs):
             self.callback = callback
-            state["constructed"].append({"model": model, "device": device, "two_stems": two_stems})
+            # demucs 4.x 无 two_stems 等参数；意外 kwarg 记录下来供断言
+            state["constructed"].append(
+                {"model": model, "device": device, "unexpected": sorted(kwargs)})
 
         def separate_audio_file(self, path):
             if state["fail_error"] is not None:
                 raise state["fail_error"]
             if self.callback is not None:
-                self.callback(1, 2)
-                self.callback(2, 2)
-            # 返回 (sources, channels, samples)：两轨 [vocals, no_vocals]
-            return torch.zeros(2, 1, 16000), 16000
+                # demucs 4.x 回调：进度字典（帧数为模型采样率下计数）
+                self.callback({"state": "end", "segment_offset": 441000,
+                               "audio_length": 882000})
+                self.callback({"state": "end", "segment_offset": 882000,
+                               "audio_length": 882000})
+            # 返回 (原始波形, {声部名: 张量})
+            return (torch.zeros(1, 16000),
+                    {"vocals": torch.zeros(1, 16000),
+                     "no_vocals": torch.zeros(1, 16000)})
 
     demucs = types.ModuleType("demucs")
     api = types.ModuleType("demucs.api")
@@ -60,11 +71,12 @@ class TestSeparateSuccess:
         assert warnings == []
         assert ratios == [pytest.approx(0.5), pytest.approx(1.0)]
 
-    def test_passes_model_two_stems_and_device(self, fake_demucs, tmp_path):
+    def test_passes_model_and_device_no_legacy_kwargs(self, fake_demucs, tmp_path):
         s = VocalSeparator(model_name="htdemucs", device="cuda")
         s.separate(str(tmp_path / "in.wav"), str(tmp_path))
+        # demucs 4.x Separator 无 two_stems 等参数；出现即说明误用了旧接口
         assert fake_demucs["constructed"] == [
-            {"model": "htdemucs", "device": "cuda", "two_stems": "vocals"}
+            {"model": "htdemucs", "device": "cuda", "unexpected": []}
         ]
 
 

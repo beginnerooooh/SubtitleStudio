@@ -201,12 +201,22 @@ class VoiceprintEngine:
         return self._embed([wav])[0]
 
     def _embed(self, wavs: list[np.ndarray]) -> np.ndarray:
-        """(N, T) 波形批 → (N, 192) L2 归一化 embedding。"""
+        """(N, T) 波形批 → (N, 192) L2 归一化 embedding。
+
+        批内变长时右 pad 到最长，并以 wav_lens 相对长度告知 ECAPA
+        有效语音长度（pad 部分被注意力 mask 排除，不影响嵌入）。
+        """
         import torch
 
         model = _get_ecapa(self.device)
-        tensor = torch.tensor(np.stack(wavs), dtype=torch.float32, device=self.device)
-        emb = model.encode_batch(tensor)
+        lengths = torch.tensor([len(w) for w in wavs], dtype=torch.float32)
+        max_len = int(lengths.max())
+        batch = np.zeros((len(wavs), max_len), dtype=np.float32)
+        for i, w in enumerate(wavs):
+            batch[i, : len(w)] = w
+        tensor = torch.tensor(batch, device=self.device)
+        wav_lens = lengths / max_len
+        emb = model.encode_batch(tensor, wav_lens)
         arr = emb.detach().cpu().numpy()
         if arr.ndim == 3:  # speechbrain 返回 (N, 1, D)
             arr = arr[:, 0, :]

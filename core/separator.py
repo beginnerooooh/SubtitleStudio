@@ -68,30 +68,37 @@ class VocalSeparator:
         separator = Separator(
             model=self.model_name,
             device=self.device,
-            two_stems="vocals",
+            progress=False,
             callback=self._demucs_callback,
         )
         self._separator = separator
-        sources, sample_rate = separator.separate_audio_file(wav_path)
-        vocals = self._pick_vocals(separator, sources)
-        out_path = str(Path(output_dir) / "vocals.wav")
-        _write_wav(vocals, sample_rate, out_path)
+        _, stems = separator.separate_audio_file(wav_path)
+        vocals = self._pick_vocals(stems)
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = str(out_dir / "vocals.wav")
+        _write_wav(vocals, separator.samplerate, out_path)
         return out_path
 
-    def _demucs_callback(self, done: int, total: int) -> None:
-        """Demucs 分块处理回调：先查取消，再上报阶段内进度。"""
+    def _demucs_callback(self, info: dict) -> None:
+        """Demucs 分块处理回调：先查取消，再上报阶段内进度。
+
+        demucs 4.x 回调收单个进度字典：state（start/end）与
+        segment_offset / audio_length（均为模型采样率下的帧数）。
+        """
         self._check_cancel()
-        if self.on_progress and total:
-            self.on_progress(min(1.0, done / total))
+        if self.on_progress and info.get("state") == "end":
+            total = float(info.get("audio_length") or 0)
+            done = float(info.get("segment_offset") or 0)
+            if total > 0:
+                self.on_progress(min(1.0, done / total))
 
     @staticmethod
-    def _pick_vocals(separator, sources):
-        """按模型声部名取 vocals 轨；取不到时退回第一轨（two_stems 时首轨即人声）。"""
-        names = getattr(getattr(separator, "model", None), "sources", None) or ["vocals", "no_vocals"]
-        for i, name in enumerate(names):
-            if name == "vocals":
-                return sources[i]
-        return sources[0]
+    def _pick_vocals(stems: dict):
+        """按声部名取 vocals 轨；模型无该声部时退回第一轨。"""
+        if "vocals" in stems:
+            return stems["vocals"]
+        return next(iter(stems.values()))
 
     def _warn(self, message: str) -> None:
         if self.on_warning:

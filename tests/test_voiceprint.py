@@ -255,6 +255,53 @@ class TestLoadSpan:
             vp._load_span(str(path), 0, 0.5)
 
 
+class TestEmbedVariableLength:
+    """_embed 批内变长 pad 行为（mock _get_ecapa 接缝，不碰真实模型）。"""
+
+    def test_variable_batch_padded_to_max_with_lens(self, monkeypatch):
+        import torch
+
+        captured = {}
+
+        class FakeModel:
+            def encode_batch(self, tensor, wav_lens=None):
+                captured["shape"] = tuple(tensor.shape)
+                captured["lens"] = wav_lens.tolist() if wav_lens is not None else None
+                # speechbrain 风格返回 (N, 1, D)；ones 保证 L2 归一化后有定义
+                n = tensor.shape[0]
+                return torch.ones(n, 1, 192)
+
+        monkeypatch.setattr(vp, "_get_ecapa", lambda device: FakeModel())
+        engine = VoiceprintEngine()
+        wavs = [np.ones(16000, dtype=np.float32),
+                np.full(8000, 0.5, dtype=np.float32)]
+        out = engine._embed(wavs)
+        assert captured["shape"] == (2, 16000)          # pad 到最长
+        assert captured["lens"] == [1.0, 0.5]           # 相对长度
+        assert out.shape == (2, 192)                     # (N, D)
+        assert np.allclose(np.linalg.norm(out, axis=1), 1.0, atol=1e-6)
+
+    def test_equal_length_batch_unchanged(self, monkeypatch):
+        import torch
+
+        captured = {}
+
+        class FakeModel:
+            def encode_batch(self, tensor, wav_lens=None):
+                captured["shape"] = tuple(tensor.shape)
+                captured["lens"] = wav_lens.tolist() if wav_lens is not None else None
+                n = tensor.shape[0]
+                return torch.zeros(n, 1, 192)
+
+        monkeypatch.setattr(vp, "_get_ecapa", lambda device: FakeModel())
+        engine = VoiceprintEngine()
+        wavs = [np.ones(16000, dtype=np.float32),
+                np.zeros(16000, dtype=np.float32)]
+        engine._embed(wavs)
+        assert captured["shape"] == (2, 16000)
+        assert captured["lens"] == [1.0, 1.0]
+
+
 class TestModelSeam:
     def test_embed_raises_readable_when_speechbrain_missing(self, monkeypatch):
         def boom(device):

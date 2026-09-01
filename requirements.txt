@@ -29,7 +29,7 @@ faster-whisper>=1.0
 transformers>=4.44,<5
 torch>=2.2
 torchaudio>=2.2
-demucs>=0.4.1
+demucs>=4.0
 soundfile>=0.12
 numpy
 
