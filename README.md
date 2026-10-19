@@ -1,4 +1,4 @@
-# Subtitle Studio
+﻿# Subtitle Studio
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
@@ -361,6 +361,12 @@ python app/desktop_server.py
 - [SpeechBrain](https://speechbrain.github.io/)（ECAPA-TDNN 声纹）
 - [Demucs](https://github.com/facebookresearch/demucs)（人声分离）
 - [Gradio](https://gradio.app/) · [Electron](https://www.electronjs.org/) · [FFmpeg](https://ffmpeg.org/)
+
+---
+
+## 更新日志
+
+版本变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
