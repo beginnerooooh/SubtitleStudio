@@ -1,0 +1,384 @@
+# Subtitle Studio
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
+[![Electron](https://img.shields.io/badge/Desktop-Electron-9feaf9.svg)](https://www.electronjs.org/)
+
+[中文](README.md) · **English**
+
+A local-first subtitle generator and editor for livestreams and video. It turns recordings
+into **ready-to-use** subtitles, then lets you proofread, split, and re-time them on a
+timeline in a lightweight desktop app modelled on professional editing software.
+
+**Highlights**
+
+- **Fully local** — recognition, speaker verification, and lyric alignment run on your machine. No audio or video ever leaves it.
+- **Built for livestreams** — handles the audio problems that livestreams actually have: singing, vocals inside BGM, and multi-person chatter.
+- **Measurable** — compares output against a human-proofread reference line by line, and reports accuracy you can interpret.
+- **Editable** — dual-track timeline plus video preview, with on-canvas subtitle positioning.
+
+---
+
+## Contents
+
+- [Features](#features)
+- [Getting Started](#getting-started)
+- [Interface](#interface)
+- [How It Works](#how-it-works)
+- [Command Line](#command-line)
+- [Backend API](#backend-api)
+- [Configuration](#configuration)
+- [Project Layout](#project-layout)
+- [Development](#development)
+- [Known Limitations](#known-limitations)
+- [License](#license)
+
+---
+
+## Features
+
+### Recognition
+
+- **Multiple engines** — faster-whisper (large-v3 and others) / FunASR (paraformer-zh) / external HTTP service
+- **Chunked decoding** — long audio is decoded in overlapping chunks so the model cannot silently skip whole passages
+- **VAD disabled by default** — during livestreams, singing and soft onsets tend to be swallowed by VAD
+- **Timeline correction** — cross-correlates the subtitle coverage curve with audio activity across the full recording
+- **Smart line breaking** — dynamic programming over length, punctuation, and pause costs produces natural reading breaks
+- **Hotword boosting** — frequent nicknames and terms extracted from chat XML are fed to the engine to reduce name errors
+
+### Speaker Verification & BGM
+
+- **Single-target verification** — answers only "is this the current streamer?", using both speech and singing voiceprints
+- **Multi-factor BGM detection** — voiceprint similarity + instrumental presence + stereo side signal + loudness variance
+- **Marks by default, never deletes** — window-level discrimination is limited, and aggressive deletion removes the
+  streamer's own speech. So suspected original-vocal segments are listed with their evidence for you to confirm.
+
+### Songs
+
+Four-stage chain, increasing in cost, stopping at the first hit:
+
+```
+song requests in chat  →  local lyric library  →  online sources (NetEase / Kugou / LRCLIB)  →  audio fingerprinting
+```
+
+Online sources support **automatic fallback**: if the best match from one source has the wrong
+artist, the next source is tried. A self-hosted lyric service can also be plugged in.
+
+### Editing
+
+- **Dual-track timeline** — video track (filmstrip thumbnails) + subtitle track
+- **Drag to retime** — drag a clip to move it, drag either edge to change start or end (green = start, orange = end)
+- **Marquee selection** — drag on empty space with the left button to select many subtitles, then act on them from the context menu
+- **Timecode** — uniformly `HH:MM:SS:FF`, with the frame rate read from the video
+- **Subtitle styling** — size / colour / outline / position (presets or free dragging)
+- **Convenience** — autosave, undo/redo, drafts, crash recovery, cache cleanup
+
+### Evaluation
+
+Compare generated output against a human-proofread reference:
+
+- Line-level exact match, text match, and timing match rates
+- Character error rate (CER) and character recall
+- **Ceiling analysis** — quantifies why 100% is unattainable
+- A list of boundary cases that still need human review
+
+---
+
+## Getting Started
+
+### Requirements
+
+| Dependency | Notes |
+|---|---|
+| Python 3.10+ | Verified on 3.12 |
+| FFmpeg | Audio/video extraction and thumbnail generation |
+| Node.js 18+ | **Desktop app only** (build time); not needed at runtime |
+| NVIDIA GPU (optional) | 4 GB VRAM runs large-v3 at int8_float16; falls back to CPU without one |
+
+### Installation
+
+```bash
+git clone https://github.com/beginnerooooh/SubtitleStudio.git
+cd SubtitleStudio
+
+# Create a virtual environment and install dependencies
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+
+# Verify the environment (reports GPU / FFmpeg / available engines)
+python tools/cli.py info
+```
+
+> Models are downloaded automatically on first use. For a fully offline setup, place them
+> in `models/` beforehand — see [Configuration](#configuration).
+
+### Generate Your First Subtitle
+
+```bash
+# Generate subtitles from a video
+python tools/cli.py generate path/to/video.mp4
+
+# Generate and evaluate against a reference
+python tools/cli.py generate path/to/video.mp4 --ref path/to/reference.srt
+
+# Results land in outputs/<video name>/<timestamp>/ (srt / lrc / ass / vtt / json)
+```
+
+### Launch a GUI
+
+**Desktop (recommended)**
+
+```bash
+cd desktop
+npm install      # installs Electron on first run
+npm start
+```
+
+The desktop app starts its own local backend — no need to install Python separately or
+remember a port.
+
+**Web (Gradio)**
+
+```bash
+python launcher.py          # opens http://127.0.0.1:7860 in your browser
+python launcher.py --debug  # keeps the console and DEBUG logs
+```
+
+---
+
+## Interface
+
+### Desktop
+
+The layout follows mainstream editing software:
+
+```
+┌─ Toolbar: open video · chat · subtitles · recognize · undo/redo · QC · export ──────┐
+├──────────┬──────────────────────────────────────┬──────────────────────────────────┤
+│ Left     │  Video preview                       │ Subtitle list                    │
+│ ▸ Media  │  (subtitles overlaid live,           │  click to seek                   │
+│ ▸ Library│   draggable in free mode)            │  double-click to edit text       │
+│ ▸ ASR    │                                      │  context menu                    │
+│ ▸ Style  │  ▶ 00:00:00:12 / 00:51:33:01 ══●═══  │                                  │
+│ ▸ Output ├──────────────────────────────────────┤  150 lines                       │
+│          │ split merge delete new│copy paste│fit │                                  │
+│          │ ┌──────────────────────────────────┐ │                                  │
+│          │ │video   ▓▓▒▒▓▓▒▒ (filmstrip)      │ │                                  │
+│          │ │subtitle ███ ████ ██ ██████ ███    │ │                                  │
+│          │ └──────────────────────────────────┘ │                                  │
+├──────────┴──────────────────────────────────────┴──────────────────────────────────┤
+│ Log drawer (collapsed by default): log / songs / BGM review                         │
+└─ Status bar ────────────────────────────────────────────────────────────────────────┘
+```
+
+| Area | Capability |
+|---|---|
+| **Video preview** | Subtitles overlaid live; style changes apply instantly. In free mode you can drag the subtitle directly on the frame |
+| **Dual-track timeline** | Video track (filmstrip, cached after first build) + subtitle track (each clip shows its text) |
+| **Drag to retime** | Drag a clip to move it, drag either edge to change start or end; green = start, orange = end |
+| **Marquee select** | Drag on empty space with the left button to select many subtitles; then right-click to act on all of them |
+| **Timecode** | Uniform `HH:MM:SS:FF` throughout (frame rate read from the video) |
+| **Visible range** | Constrained to 5 seconds – 10 minutes, with a logarithmic slider. "Fit subtitles" jumps to a readable density |
+| **Resizable layout** | All four panes are draggable; stretching the timeline compresses the log first, so **preview height is preserved** |
+| **State memory** | Pane visibility, section collapse state, and pane sizes are all restored automatically |
+| **Export** | Choose formats and destination |
+
+Default shortcuts: `Space` play · `Ctrl+Z`/`Ctrl+Shift+Z` undo/redo · `Ctrl+B` split ·
+`Ctrl+M` merge · `Ctrl+C`/`Ctrl+V` copy/paste · `Ctrl+D` duplicate · `Delete` remove ·
+`Ctrl+S` export · `←`/`→` seek 0.5 s. All are customisable in the Shortcuts dialog.
+
+### Web (Gradio)
+
+Five tabs: Generate / Proofread / Evaluate / Voiceprint & Lyrics / Settings. Useful when
+Electron is unavailable or for remote access.
+
+---
+
+## How It Works
+
+Processing pipeline (`app/core/pipeline2.py`):
+
+```
+audio/video input
+  → audio extraction (16 kHz mono WAV)
+  → vocal separation (optional)
+  → speaker verification / BGM analysis (optional)
+  → recognition (chunked decoding + exclusive-range dedup)
+  → song detection and lyric alignment (optional)
+  → line breaking (DP) + punctuation restoration
+  → timeline correction
+  → dedup / overlap repair / monotonicity
+  → export + evaluation
+```
+
+**Key design decisions** — each backed by measurements; see [docs/EVALUATION.md](docs/EVALUATION.md):
+
+- **VAD disabled** — Silero VAD swallows singing and soft onsets, losing whole passages
+- **Chunking with overlap** — whisper silently skips content in long audio (26 s skipped, measured)
+- **BGM detected, not deleted** — window-level accuracy is around 0.76, too low to delete automatically
+- **Punctuation is a hint only** — it guides line breaking; final text comes from recognition
+
+---
+
+## Command Line
+
+```bash
+# Generate subtitles
+python tools/cli.py generate <video> [--ref <srt>] [--chunk 120] [--engine whisper]
+
+# Evaluate two subtitle files (--max-cer sets a CI threshold; exits non-zero if exceeded)
+python tools/cli.py evaluate --ref <srt> --hyp <srt> --json
+
+# Batch-process a directory
+python tools/cli.py batch <dir>
+
+# Environment and defaults
+python tools/cli.py info
+```
+
+---
+
+## Backend API
+
+`app/desktop_server.py` exposes a local HTTP API built on the standard library, with no
+extra dependencies. The desktop and web UIs share the same logic.
+
+| Endpoint | Description |
+|---|---|
+| `GET /api/health` | Environment, available engines, and lyric sources |
+| `GET/POST/DELETE /api/projects[...]` | Project CRUD, save, autosave, undo/redo, export |
+| `POST /api/edit/<op>` | Stateless edits: split / merge / delete / insert / update / retime_edge / copy / paste / duplicate / qc |
+| `POST /api/generate` · `GET /api/jobs/<id>` | Async generation jobs and progress polling |
+| `POST /api/evaluate` | Evaluation |
+| `GET/POST /api/lyrics/*` | Lyric source list, search, self-hosted endpoint |
+| `GET /api/media?path=` | Media stream (Range supported) |
+| `GET /api/videoinfo?path=` | Frame rate and duration (for timecode) |
+| `GET /api/thumbs?path=` | Timeline filmstrip thumbnails |
+| `GET /api/danmaku?path=` | Chat summary (streamer / gifts / song requests / hotwords) |
+| `GET/POST /api/cache/*` · `/api/drafts/clean` | Cache statistics and cleanup, draft cleanup |
+| `GET/POST /api/profiles[...]` | Voiceprint list, enrolment, deletion |
+
+---
+
+## Configuration
+
+Defaults live in `app/core/config.py` and can all be overridden by environment variables.
+Common ones:
+
+| Variable | Default | Description |
+|---|---|---|
+| `SS_DEVICE` | `auto` | `auto` / `cuda` / `cpu` |
+| `SS_MODELS_DIR` | `models` | Model directory |
+| `SS_CACHE_DIR` | `cache` | Regenerable intermediate files |
+| `SS_OUTPUT_DIR` | `outputs` | Generated results |
+| `SS_ASR_ENGINE` | `whisper` | Default engine |
+| `SS_LYRIC_PROVIDERS` | `netease,kugou,lrclib` | Lyric source order |
+
+Model layout:
+
+```
+models/
+  ct2/<model>/            faster-whisper models (CTranslate2 format)
+  hf/                     HuggingFace cache (ECAPA voiceprint, vocal separation)
+  modelscope/             ModelScope cache (FunASR, timestamp prediction)
+```
+
+---
+
+## Project Layout
+
+```
+app/
+  app.py                 Web UI (Gradio)
+  desktop_server.py      Desktop local API (stdlib HTTP)
+  core/
+    pipeline2.py         Pipeline orchestration
+    providers/           Pluggable recognition backends (whisper / funasr / external)
+    segmenter.py         Line-breaking dynamic programming
+    punctuate.py         Punctuation restoration (line-breaking hint only)
+    timing.py            Timeline correction
+    bgm.py               Multi-factor BGM detection
+    song.py              Song detection / multi-source lyric search / forced alignment
+    streamer.py          Single-target voiceprint (speech + singing)
+    livexml.py           Chat / gift / SC / guard XML parsing
+    store.py             Projects / drafts / undo / autosave / cache cleanup
+    evaluate.py          Evaluation and boundary-case analysis
+    editor.py            Edit operations (pure functions)
+    subtitle.py          Multi-format export
+    separator.py         Vocal separation (Demucs)
+    audio.py             Audio extraction and probing
+    models.py            Data models (SubtitleLine / Word)
+    text.py              Text normalisation
+    env.py               Environment detection (device / FFmpeg)
+    config.py            Central configuration
+desktop/                 Electron desktop app
+  main.js                Main process (starts backend, window, menus)
+  preload.js             Security bridge
+  renderer/              UI (HTML / CSS / JS)
+docs/EVALUATION.md       Evaluation report (root-cause analysis and reproduction)
+tools/cli.py             Command line
+tools/check_desktop_ids.py  Desktop DOM element ID consistency check
+tests/test_core_v2.py    Unit tests (80 cases, no GPU required)
+```
+
+---
+
+## Development
+
+```bash
+# Run the tests (no GPU required)
+python -m pytest tests/ -q
+
+# Check desktop element ID consistency (catches JS referencing removed nodes)
+python tools/check_desktop_ids.py
+
+# Start the backend for debugging the UI in a browser
+python app/desktop_server.py
+```
+
+Conventions:
+
+- Modules under `core/` favour **pure functions**, which keeps them testable and undoable
+- Edit operations never mutate their input; they return a new list
+- The desktop app handles UI and interaction only — business logic always goes through the backend API
+- Before committing, make sure both `pytest` and `check_desktop_ids.py` pass
+
+---
+
+## Known Limitations
+
+- **100% exact match is unattainable** — local ASR reaches roughly 73% character accuracy on
+  real livestream audio. Even with perfect line breaking, the ceiling for fully matching lines
+  is around 36%. Closing the gap further requires external text sources (lyric libraries, chat,
+  or user-supplied transcripts).
+- **BGM detection marks rather than deletes** — window-level voiceprint separation is limited,
+  and automatic deletion removes the streamer's own content.
+- **Song recognition needs network access** — online lyric sources require a connection; offline
+  use is limited to the local lyric library.
+- **Chat XML currently covers BililiveRecorder 2.x** — other platforms need additional parsers.
+- **Slow without a GPU** — use the `medium` or `small` model instead.
+
+---
+
+## Acknowledgements
+
+Built on the following open-source work:
+
+- [faster-whisper](https://github.com/SYSTRAN/faster-whisper) / [CTranslate2](https://github.com/OpenNMT/CTranslate2)
+- [FunASR](https://github.com/modelscope/FunASR) / [ModelScope](https://modelscope.cn/)
+- [SpeechBrain](https://speechbrain.github.io/) (ECAPA-TDNN voiceprints)
+- [Demucs](https://github.com/facebookresearch/demucs) (vocal separation)
+- [Gradio](https://gradio.app/) · [Electron](https://www.electronjs.org/) · [FFmpeg](https://ffmpeg.org/)
+
+---
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
+
+---
+
+## License
+
+[MIT License](LICENSE)

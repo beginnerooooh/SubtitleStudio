@@ -1,8 +1,10 @@
-﻿# Subtitle Studio
+# Subtitle Studio
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![Electron](https://img.shields.io/badge/Desktop-Electron-9feaf9.svg)](https://www.electronjs.org/)
+
+**中文** · [English](README.en.md)
 
 本地运行的直播 / 视频字幕生成与编辑工具。把录音或录像自动转成**可直接使用**的字幕，
 并提供一个对标剪辑软件的轻量桌面端，在时间轴上逐句校对、切分与调时。
