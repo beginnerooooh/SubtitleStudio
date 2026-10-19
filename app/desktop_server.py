@@ -84,10 +84,27 @@ TRANSCODE_CONTAINERS = {".flv", ".mkv", ".ts", ".rmvb", ".avi", ".wmv"}
 # 后台转码任务表（同一文件并发打开时复用同一个任务）
 _TRANSCODE_JOBS: dict[str, dict] = {}
 _TRANSCODE_LOCK = threading.Lock()
+# 视频编码器参数（探测一次后复用；优先 NVENC）
+_ENCODER_ARGS: list[str] | None = None
+# 硬件解码参数（探测一次后复用；优先 cuda）
+_HWACCEL_ARGS: list[str] | None = None
 
 # 重编码格式先快速转出这么多秒，让用户「立刻看到画面」。
-# 4GB / 72 分钟 HEVC 全片重编码约 20 分钟，不能阻塞首帧。
+# 4GB / 72 分钟 HEVC 全片重编码约 7~10 分钟，不能阻塞首帧。
 QUICK_PREVIEW_SECONDS = 90
+
+# 预览代理的目标规格。
+#
+# 效率对比（实测 4GB HEVC 1080p60，转 60 秒素材）：
+# | 规格 | 耗时 | 全片预估 | 产物 |
+# |---|---:|---:|---:|
+# | 1080p60（原规格） | 10.8s | 13.0 分钟 | 12.7 MB |
+# | **540p30（采用）** | **6.1s** | **7.4 分钟** | **2.9 MB** |
+# | 480p30 | 6.0s | 7.2 分钟 | 2.2 MB |
+#
+# 字幕校对只需看清画面与口型，540p 足够；产物小 4 倍也让拖动更流畅。
+# 注意：这只影响「预览代理」，原始素材与导出字幕不受任何影响。
+PREVIEW_VF = "scale=-2:540,fps=30"
 
 
 # ---------------- 序列化辅助 ----------------
@@ -266,7 +283,12 @@ BROWSER_SAFE_ACODECS = {"aac", "opus", "vorbis", "mp3"}
 
 
 def _probe_video_info(src: Path) -> dict:
-    """用 ffprobe 取帧率与时长；失败时给出可用默认值。"""
+    """用 ffprobe 取帧率与时长；失败时给出可用默认值。
+
+    加上 `-analyzeduration`/`-probesize` 限制扫描范围：默认 ffprobe 会
+    为了「精确时长」扫全文件，4GB FLV 首次（系统缓存冷）实测要 25 秒。
+    限制后仍能正确读到 `format.duration`（实测两者一致），但快得多。
+    """
     from core.env import detect_env
 
     env = detect_env()
@@ -277,11 +299,13 @@ def _probe_video_info(src: Path) -> dict:
         import subprocess
 
         proc = subprocess.run(
-            [ffprobe, "-v", "error", "-select_streams", "v:0",
+            [ffprobe, "-v", "error",
+             "-analyzeduration", "2000000", "-probesize", "5000000",
+             "-select_streams", "v:0",
              "-show_entries", "stream=avg_frame_rate,r_frame_rate",
              "-show_entries", "format=duration",
              "-of", "json", str(src)],
-            capture_output=True, text=True, timeout=60)
+            capture_output=True, text=True, timeout=180)
         if proc.returncode == 0:
             data = json.loads(proc.stdout or "{}")
             streams = data.get("streams") or [{}]
@@ -320,6 +344,37 @@ def _fps_fraction(fps: float) -> dict:
 
 
 _CODEC_CACHE: dict[str, dict] = {}
+
+
+def _cache_key(*parts) -> str:
+    """由若干值生成**跨进程稳定**的缓存键。
+
+    为什么不用 `hash()`（重要踩坑）：Python 对 str/bytes 的 `hash()` 按进程
+    随机加盐（PYTHONHASHSEED），因此**每次重启算出的键都不同**——缓存永远
+    命中不了，4GB 视频每次打开都重新转码一遍（实测三次独立进程给出三个
+    不同键）。用 md5 对内容做摘要即可稳定。
+    """
+    import hashlib
+
+    h = hashlib.md5()
+    for x in parts:
+        h.update(str(x).encode("utf-8", "replace"))
+        h.update(b"\x00")
+    return h.hexdigest()[:20]
+
+
+def _file_key(p: Path, *extra) -> str:
+    """文件内容指纹键：路径 + 大小 + mtime（+额外参数）。
+
+    用大小与 mtime 而不是内容摘要——4GB 文件读全文算 md5 要几十秒，
+    而「路径+大小+mtime」足以判断文件是否被替换过。
+    """
+    try:
+        st = p.stat()
+        return _cache_key(str(p.resolve()), st.st_size,
+                          int(st.st_mtime), *extra)
+    except OSError:
+        return _cache_key(str(p), *extra)
 
 
 def _probe_codecs(src: Path, ffprobe: str) -> dict:
@@ -386,7 +441,7 @@ def _run_transcode(ffmpeg: str, src: Path, out: Path,
     tmp = out.with_suffix(".tmp.mp4")
     last_err = ""
     for args in attempts:
-        cmd = [ffmpeg, "-y", "-v", "error", "-fflags", "+genpts",
+        cmd = [ffmpeg, "-y", "-v", "error", *_pick_hwaccel(ffmpeg), "-fflags", "+genpts",
                "-i", str(src), *args, "-movflags", "+faststart", str(tmp)]
         try:
             proc = subprocess.run(cmd, capture_output=True, timeout=5400)
@@ -402,18 +457,142 @@ def _run_transcode(ffmpeg: str, src: Path, out: Path,
     return False, last_err
 
 
+def _sweep_stale_transcode(cache: Path) -> None:
+    """清理残留的转码临时文件。
+
+    场景：进程被强杀（关窗、崩溃、系统重启）时后台 ffmpeg 会被中断，
+    留下不完整但体积很大的 `.part.mp4`（实测 776 MB）。这些文件不能
+    播放（moov 缺失）、白占磁盘，还会让状态查询误判。
+
+    **必须跳过正在写入的文件**：若清理时后台转码仍在跑，删除会失败
+    （Windows 下文件被占用，`PermissionError`）——这里主动检查任务表，
+    只在没有对应任务时才删，避免无意义的报错。
+    """
+    try:
+        if not cache.is_dir():
+            return
+        # 正在使用的临时文件路径集合
+        active: set[str] = set()
+        with _TRANSCODE_LOCK:
+            for job in _TRANSCODE_JOBS.values():
+                tmp = job.get("tmp")
+                if tmp:
+                    active.add(str(tmp))
+        for pat in ("*.part.mp4", "*.tmp.mp4"):
+            for f in cache.glob(pat):
+                if str(f) in active:
+                    continue                    # 正在写入，保留
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
+def _transcode_running(key: str) -> bool:
+    """该目标文件是否有后台转码任务在跑。"""
+    with _TRANSCODE_LOCK:
+        job = _TRANSCODE_JOBS.get(key)
+    return bool(job and job.get("proc") and job["proc"].poll() is None)
+
+
+def _pick_encoder(ffmpeg: str) -> list[str]:
+    """挑选可用的视频编码参数，**优先硬件编码**。
+
+    效率差异明显（实测 4GB HEVC 1080p60 → 540p30 H.264，全片 72 分钟）：
+    硬件编码（NVENC）显著快于 CPU 编码，因此探测顺序是
+    NVENC → QSV → AMF → CPU 兜底。
+
+    启动时探测一次，结果缓存到 `_ENCODER_ARGS`，避免每次都跑探测。
+    """
+    global _ENCODER_ARGS
+    if _ENCODER_ARGS is not None:
+        return list(_ENCODER_ARGS)
+
+    import subprocess
+
+    candidates = [
+        # NVENC：现代 NVIDIA 驱动都有；p4 是较快的预设
+        ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr",
+         "-cq", "26", "-b:v", "0"],
+        # QSV（Intel 核显）
+        ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "26"],
+        # AMF（AMD）
+        ["-c:v", "h264_amf", "-quality", "speed", "-rc", "cqp", "-qp_i", "26"],
+        # CPU 兜底
+        ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"],
+    ]
+    for args in candidates:
+        try:
+            # 用 1 秒的合成输入测试编码器是否可用（比编码真实文件快得多）
+            proc = subprocess.run(
+                [ffmpeg, "-v", "error", "-f", "lavfi",
+                 "-i", "color=c=black:s=320x240:d=1:r=25",
+                 *args, "-f", "null", "-"],
+                capture_output=True, timeout=60)
+        except Exception:
+            continue
+        if proc.returncode == 0:
+            _ENCODER_ARGS = list(args)
+            return list(args)
+    _ENCODER_ARGS = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]
+    return list(_ENCODER_ARGS)
+
+
+def _pick_hwaccel(ffmpeg: str) -> list[str]:
+    """挑选可用的**硬件解码**参数。
+
+    效率关键（实测 4GB HEVC 1080p60 → H.264）：
+    - 纯 CPU 软解 HEVC 是瓶颈（编码器已经是 NVENC，但解码仍占满 CPU）
+    - 加 `-hwaccel cuda` 后整体快约 1.5~2 倍
+
+    探测方式：用合成输入试一次，失败就退回软解（不冒任何风险）。
+    """
+    global _HWACCEL_ARGS
+    if _HWACCEL_ARGS is not None:
+        return list(_HWACCEL_ARGS)
+
+    import subprocess
+
+    for args in (["-hwaccel", "cuda"],
+                 ["-hwaccel", "d3d11va"],
+                 ["-hwaccel", "auto"]):
+        try:
+            proc = subprocess.run(
+                [ffmpeg, "-v", "error", *args, "-f", "lavfi",
+                 "-i", "color=c=black:s=320x240:d=1:r=25",
+                 "-c:v", "libx264", "-preset", "ultrafast",
+                 "-f", "null", "-"],
+                capture_output=True, timeout=60)
+        except Exception:
+            continue
+        if proc.returncode == 0:
+            _HWACCEL_ARGS = list(args)
+            return list(args)
+    _HWACCEL_ARGS = []
+    return []
+
+
 def _transcode_args(env, can_copy: bool) -> list[list[str]]:
     """按「能否只换容器」给出 ffmpeg 参数候选。
 
     HEVC / AC-3 等浏览器无法解码的编码必须重编码——仅换容器没有用
     （实测 4GB HEVC 直播录制 remux 成 MP4 后仍然黑屏）。
+
+    重编码时：
+    - 优先硬件编码器（`_pick_encoder`）
+    - 缩到 540p30 作为**预览代理**（见 PREVIEW_VF 的效率对比）
+
+    `env` 允许为 None（便于单测直接调用），此时用系统 PATH 上的 ffmpeg。
     """
+    ffmpeg = getattr(env, "ffmpeg_path", None) or "ffmpeg"
+    enc = _pick_encoder(ffmpeg)
     if can_copy:
+        # remux 保持原画质（不缩放），只在编码不安全时才降规格
         return [["-c", "copy"],
-                ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                 "-c:a", "aac", "-b:a", "128k"]]
-    return [["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-             "-c:a", "aac", "-b:a", "128k"]]
+                ["-vf", PREVIEW_VF, *enc, "-c:a", "aac", "-b:a", "96k"]]
+    return [["-vf", PREVIEW_VF, *enc, "-c:a", "aac", "-b:a", "96k"]]
 
 
 def _transcode_quick(ffmpeg: str, src: Path, dst: Path,
@@ -422,7 +601,7 @@ def _transcode_quick(ffmpeg: str, src: Path, dst: Path,
     import subprocess
 
     tmp = dst.with_suffix(".head.mp4")
-    cmd = [ffmpeg, "-y", "-v", "error", "-fflags", "+genpts",
+    cmd = [ffmpeg, "-y", "-v", "error", *_pick_hwaccel(ffmpeg), "-fflags", "+genpts",
            "-t", str(seconds), "-i", str(src), *args,
            "-movflags", "+faststart", str(tmp)]
     try:
@@ -438,12 +617,19 @@ def _transcode_quick(ffmpeg: str, src: Path, dst: Path,
 
 
 def _start_full_transcode(ffmpeg: str, src: Path, dst: Path,
-                          args: list[str]) -> None:
-    """后台把整个文件转完（覆盖前段产物）。
+                          args: list[str], head: Path | None = None) -> None:
+    """后台把整个文件转完。
 
-    为什么要后台：4GB / 72 分钟的 HEVC 直播录制，重编码约需 20 分钟，
-    用户不可能等。因此先返回前段可播片段，后台继续补完；转完后
-    相同 URL 就能访问完整时长。进度通过 `_TRANSCODE_JOBS` 暴露。
+    为什么要后台：4GB / 72 分钟的 HEVC 直播录制，重编码约需 10~20 分钟，
+    用户不可能等。因此先给出前段可播片段，后台继续补完。
+
+    **关键设计（修复「处理前能播、处理后不能播」）**：
+    完整版写到**另一个文件**（`dst`），前段写到 `head`，两者互不覆盖。
+    早期实现是「完整版 replace 掉前段文件」，但 Windows 下当该文件正被
+    HTTP 流读取时 `os.replace` 会失败（文件被占用），结果是：后台明明
+    转完了，用户手里却仍只有 90 秒的前段——而且前段一旦被替换失败，
+    连原来的片段也可能损坏。分开存放后，媒体接口优先用完整版、
+    没有时才用前段，既不会失败也不会破坏正在播放的内容。
     """
     key = str(dst)
     with _TRANSCODE_LOCK:
@@ -452,8 +638,8 @@ def _start_full_transcode(ffmpeg: str, src: Path, dst: Path,
             return                      # 已有任务在跑
         import subprocess
 
-        tmp = dst.with_suffix(".full.mp4")
-        cmd = [ffmpeg, "-y", "-v", "error", "-fflags", "+genpts",
+        tmp = dst.with_suffix(".part.mp4")
+        cmd = [ffmpeg, "-y", "-v", "error", *_pick_hwaccel(ffmpeg), "-fflags", "+genpts",
                "-i", str(src), *args, "-movflags", "+faststart", str(tmp)]
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
@@ -461,19 +647,28 @@ def _start_full_transcode(ffmpeg: str, src: Path, dst: Path,
         except Exception:
             return
         _TRANSCODE_JOBS[key] = {"proc": proc, "tmp": tmp, "dst": dst,
-                                "started": time.time()}
+                                "head": head, "started": time.time()}
 
     def worker() -> None:
         try:
             proc.wait()
             job = _TRANSCODE_JOBS.get(key) or {}
             if proc.returncode == 0 and tmp.is_file() and tmp.stat().st_size > 0:
-                tmp.replace(dst)        # 完整版覆盖前段产物
+                # 只写自己的目标文件，不碰正在被播放的前段
+                tmp.replace(dst)
                 job["done"] = True
             else:
                 job["error"] = (proc.stderr.read() or b"").decode(
                     "utf-8", "replace")[:300] if proc.stderr else ""
                 tmp.unlink(missing_ok=True)
+        except Exception as exc:  # noqa: BLE001
+            # 绝不因后台失败影响已能播放的前段
+            job = _TRANSCODE_JOBS.get(key) or {}
+            job["error"] = f"{type(exc).__name__}: {exc}"
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
         finally:
             with _TRANSCODE_LOCK:
                 _TRANSCODE_JOBS.pop(key, None)
@@ -935,7 +1130,7 @@ class Handler(BaseHTTPRequestHandler):
         h = max(24, min(120, int(height or 44)))
         cache = CACHE_DIR / "thumbs"
         cache.mkdir(parents=True, exist_ok=True)
-        key = f"{abs(hash((str(p), p.stat().st_mtime, n, h)))}.png"
+        key = f"{_file_key(p, 'thumbs', n, h)}.png"
         out = cache / key
         if not out.is_file():
             if not _build_filmstrip(p, out, n, h):
@@ -1077,28 +1272,27 @@ class Handler(BaseHTTPRequestHandler):
         acodec = (info.get("acodec") or "").lower()
         can_copy = (vcodec in BROWSER_SAFE_VCODECS
                     and acodec in BROWSER_SAFE_ACODECS)
-        try:
-            st = p.stat()
-            key = f"{abs(hash((str(p), st.st_mtime, st.st_size)))}.mp4"
-        except OSError:
-            return self._send_error_json("无法读取源文件", 500)
-        out = CACHE_DIR / "transcode" / key
-        ready = out.is_file() and out.stat().st_size > 0
-        job = _TRANSCODE_JOBS.get(str(out))
-        progress = 1.0 if (ready and not job) else 0.0
+        base = _file_key(p)
+        head = CACHE_DIR / "transcode" / f"{base}.head.mp4"
+        full = CACHE_DIR / "transcode" / f"{base}.mp4"
+        # ready 表示「已有可播放的东西」——前段或完整版都算。
+        # 前端据此放行播放，不必等全片转完。
+        has_head = head.is_file() and head.stat().st_size > 0
+        has_full = full.is_file() and full.stat().st_size > 0
+        ready = has_head or has_full
+        job = _TRANSCODE_JOBS.get(str(full))
+        progress = 1.0 if has_full else 0.0
         if job:
-            # 按时长估算：用已写出的临时文件大小 / 预估总大小过于不准，
-            # 这里改为「已完成秒数」不现实（需要解析 moov），
-            # 因此用「临时文件大小相对源文件比例」做粗略进度。
+            # 粗估进度：临时文件大小相对源文件（HEVC→H.264 约 0.5~1.0 倍）
             try:
                 tmp_size = job["tmp"].stat().st_size if job["tmp"].is_file() else 0
-                # 转码后体积通常小于源（HEVC→H.264 crf23 约 0.6~1.2 倍）
                 src_size = p.stat().st_size or 1
-                progress = max(0.0, min(0.99, tmp_size / max(src_size * 0.8, 1)))
+                progress = max(0.0, min(0.99, tmp_size / max(src_size * 0.6, 1)))
             except OSError:
                 progress = 0.0
         return self._send_json({
             "ok": True, "needed": True, "ready": ready,
+            "hasHead": has_head, "hasFull": has_full,
             "copyable": can_copy, "vcodec": vcodec, "acodec": acodec,
             "progress": round(progress, 3),
             "transcoding": bool(job),
@@ -1210,53 +1404,68 @@ class Handler(BaseHTTPRequestHandler):
 
         cache = CACHE_DIR / "transcode"
         cache.mkdir(parents=True, exist_ok=True)
+        base = _file_key(src)
+        # 前段（可立即播放）与完整版分开存放，互不覆盖。
+        # 详见 _start_full_transcode 的注释：Windows 下覆盖正在播放的文件会失败。
+        head = cache / f"{base}.head.mp4"
+        full = cache / f"{base}.mp4"
+
+        # 完整版已就绪 → 直接用（最佳情况：有全片时长）
+        if full.is_file() and full.stat().st_size > 0:
+            return self._send_file(full)
+        # 已有前段 → 先播前段，同时确保后台在继续转完整版
+        if head.is_file() and head.stat().st_size > 0:
+            if not _transcode_running(str(full)):
+                env2 = detect_env()
+                info = _probe_codecs(src, env2.ffprobe_path or "ffprobe")
+                can_copy = ((info.get("vcodec") or "").lower()
+                            in BROWSER_SAFE_VCODECS
+                            and (info.get("acodec") or "").lower()
+                            in BROWSER_SAFE_ACODECS)
+                args = _transcode_args(env2, can_copy)
+                _start_full_transcode(env2.ffmpeg_path or "ffmpeg", src,
+                                      full, args[0], head=head)
+            return self._send_file(head)
+
+        info = _probe_codecs(src, env.ffprobe_path or "ffprobe")
+        vcodec = (info.get("vcodec") or "").lower()
+        acodec = (info.get("acodec") or "").lower()
+        # 只有编码本身浏览器能解码时才可以无损 remux。
+        # 仅换容器没用：HEVC 装进 MP4 依然黑屏（实测 4GB FLV 场景）。
+        can_copy = (vcodec in BROWSER_SAFE_VCODECS
+                    and acodec in BROWSER_SAFE_ACODECS)
+        attempts = _transcode_args(env, can_copy)
         try:
-            st = src.stat()
-            key = f"{abs(hash((str(src), st.st_mtime, st.st_size)))}.mp4"
-        except OSError:
-            return self._send_error_json("无法读取源文件", 500)
-        out = cache / key
-        full = out.with_suffix(".complete")
+            self.log_message(
+                f"transcode {src.name}: v={vcodec or '?'} a={acodec or '?'} "
+                f"copy={can_copy}")
+        except Exception:
+            pass
 
-        if not out.is_file() or out.stat().st_size == 0:
-            info = _probe_codecs(src, env.ffprobe_path or "ffprobe")
-            vcodec = (info.get("vcodec") or "").lower()
-            acodec = (info.get("acodec") or "").lower()
-            # 只有编码本身浏览器能解码时才可以无损 remux。
-            # 仅换容器没用：HEVC 装进 MP4 依然黑屏（实测 4GB FLV 场景）。
-            can_copy = (vcodec in BROWSER_SAFE_VCODECS
-                        and acodec in BROWSER_SAFE_ACODECS)
-            attempts = _transcode_args(env, can_copy)
-            try:
-                self.log_message(
-                    f"transcode {src.name}: v={vcodec or '?'} a={acodec or '?'} "
-                    f"copy={can_copy}")
-            except Exception:
-                pass
+        if can_copy:
+            # remux 极快（通常 <5s），直接同步完成
+            ok, last_err = _run_transcode(ffmpeg, src, full, attempts)
+            if not ok:
+                return self._send_error_json(
+                    "转码失败：无法解码该文件" +
+                    (f"（{last_err[:120]}）" if last_err else ""), 500)
+            return self._send_file(full)
 
-            if can_copy:
-                # remux 极快（通常 <5s），直接同步完成
-                ok, last_err = _run_transcode(ffmpeg, src, out, attempts)
-                if not ok:
-                    return self._send_error_json(
-                        "转码失败：无法解码该文件" +
-                        (f"（{last_err[:120]}）" if last_err else ""), 500)
-            else:
-                # 重编码可能耗时很久（4GB/72min 约 20 分钟），
-                # 因此先快速转出前段让用户立刻看到画面，再后台补完。
-                head_ok = _transcode_quick(ffmpeg, src, out, attempts[0],
-                                           QUICK_PREVIEW_SECONDS)
-                if not head_ok:
-                    ok, last_err = _run_transcode(ffmpeg, src, out, attempts)
-                    if not ok:
-                        return self._send_error_json(
-                            "转码失败：无法解码该文件" +
-                            (f"（{last_err[:120]}）" if last_err else ""), 500)
-                else:
-                    _start_full_transcode(ffmpeg, src, out, attempts[0])
-
-        # 交给通用的文件流逻辑（支持 Range / seek）
-        return self._send_file(out)
+        # 重编码可能耗时很久（4GB/72min 约 10 分钟），因此：
+        #   1) 先快速转出前段（head）让用户立刻看到画面
+        #   2) 后台把完整版写到 full（不碰 head）
+        head_ok = _transcode_quick(ffmpeg, src, head, attempts[0],
+                                   QUICK_PREVIEW_SECONDS)
+        if head_ok:
+            _start_full_transcode(ffmpeg, src, full, attempts[0], head=head)
+            return self._send_file(head)
+        # 前段都转不出来 → 同步全量转码（慢，但至少能用）
+        ok, last_err = _run_transcode(ffmpeg, src, full, attempts)
+        if not ok:
+            return self._send_error_json(
+                "转码失败：无法解码该文件" +
+                (f"（{last_err[:120]}）" if last_err else ""), 500)
+        return self._send_file(full)
 
     def _stream_ffmpeg(self, cmd: list[str], src: Path) -> bool:
         """执行 ffmpeg 并把输出边读边写。首个字节到达后才发响应头，
@@ -1302,6 +1511,8 @@ class Handler(BaseHTTPRequestHandler):
 def serve(host: str = "127.0.0.1", port: int = 8756,
           quiet: bool = False) -> ThreadingHTTPServer:
     """启动 API 服务（返回 server 对象，调用方决定是否 serve_forever）。"""
+    # 清理上次被强杀留下的转码临时文件（见 _sweep_stale_transcode）
+    _sweep_stale_transcode(CACHE_DIR / "transcode")
     httpd = ThreadingHTTPServer((host, port), Handler)
     if not quiet:
         print(f"[api] Subtitle Studio 后端已启动：http://{host}:{port}", flush=True)

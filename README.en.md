@@ -414,6 +414,47 @@ Conventions:
 
 ---
 
+## Performance
+
+Measured on a 72-minute 1080p60 livestream recording (RTX 3050 Laptop, 4 GB):
+
+| Stage | Time | Notes |
+|---|---|---|
+| Audio extraction | ~5 s | FFmpeg demux, independent of video codec |
+| **Recognition (ASR)** | **~6 min** | Over 85% of total; the only stage worth optimising |
+| Timeline correction + export | ~2 s | Pure CPU, negligible |
+
+**Optimisations in effect**
+
+- **eam_size=1 (greedy decoding)** — measurably **both faster and more accurate**:
+  ASR dropped from 445 s to 247 s while EXACT / TEXT / TIME / CER / recall **all improved**.
+  On long livestream audio, beam search tends to fall into repetition loops and
+  hallucinations (a larger beam prefers "plausible sentences" over faithful transcription).
+- **chunk_seconds=120** — whisper silently skips content in long chunks. On the same
+  material, CER was 0.721 with 1200 s chunks and 0.34 with 120 s chunks.
+- **540p30 preview proxy** — transcoding 1080p60 takes 13 minutes and yields 910 MB for the
+  full recording; 540p30 takes 7.4 minutes and 224 MB. Proofreading only needs to see the
+  picture and mouth shapes.
+- **Hardware acceleration** — prefers h264_nvenc encoding with -hwaccel cuda decoding,
+  falling back to CPU encoding (libx264 veryfast) when no NVIDIA GPU is present.
+- **Cross-process transcode cache** — cache keys use a content digest (md5), **never
+  hash()**. Python's hash() is salted per process, so every restart produced a different
+  key (three independent runs gave three different keys) and re-transcoded from scratch —
+  the root cause of "it takes half an hour every time".
+- **Head segment released first** — for long recordings the first 90 seconds become playable
+  in about 12 seconds while the full version transcodes in the background.
+- **Timeline driven by source duration** — the proxy segment is only 90 seconds; rendering the
+  timeline from it would misalign every subtitle in a full-length recording.
+
+**Tried and rejected**
+
+- **Parallel chunk decoding** — ThreadPoolExecutor(max_workers=2) was *slower*
+  (72 s → 164 s). CTranslate2's GPU inference already saturates the device; concurrency
+  only adds contention.
+- **BatchedInferencePipeline** — requires VAD segments (conflicting with the core decision
+  to keep VAD off) and returns timestamps relative to each clip, needing extra compensation
+  logic. Uncertain gain against a concrete misalignment risk.
+
 ## Known Limitations
 
 - **100% exact match is unattainable** — local ASR reaches roughly 73% character accuracy on

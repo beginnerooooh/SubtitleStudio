@@ -35,6 +35,9 @@ const S = {
   zoom: 1,            // 由 span 派生的缩放倍数（仅用于显示与交互）
   span: 15 * 60,      // 当前可见区间（秒），受 [15s, 15min] 限制
   viewStart: 0,       // 可见区起点（秒）
+  // 源文件总时长（由 /api/videoinfo 探测）。转码格式只播前段代理时，
+  // <video>.duration 会偏小，必须用这个值作为时间轴权威时长。
+  sourceDuration: 0,
   keys: {},
   autosave: true,
   _tl: null,
@@ -203,10 +206,20 @@ function busyProgress(ratio, sub) {
  * 重入时抛错而不是返回 undefined——静默返回会让调用方拿到假数据，
  * 进而写入项目状态（很难排查）。
  *
- * @param {string} label   给用户看的操作名
- * @param {Function} fn    实际工作（可以是 async）
+ * **关键：深度计数必须有超时兜底**。若某个 await 永远不返回（例如
+ * 卡住的 fetch），`finally` 就不会执行，深度永久 > 0，之后所有操作都
+ * 被拒并提示「上一操作尚未完成」——用户看到的现象就是「点什么都没反应」。
+ * 因此这里记录开始时间，超过 MAX_BUSY_MS 自动复位。
  */
+const MAX_BUSY_MS = 20 * 60 * 1000;      // 20 分钟：足够覆盖最长转码
+
 async function withBusy(label, fn) {
+  // 兜底：发现卡死过久的残留计数就复位
+  if (Busy.depth > 0 && Busy.startedAt
+      && Date.now() - Busy.startedAt > MAX_BUSY_MS) {
+    Busy.depth = 0;
+    busyHide();
+  }
   if (Busy.depth > 0) {
     const e = new Error('上一操作尚未完成，请稍候');
     e.__handled = true;
@@ -214,20 +227,91 @@ async function withBusy(label, fn) {
     throw e;
   }
   Busy.depth += 1;
+  Busy.startedAt = Date.now();
   const showTimer = setTimeout(() => busyShow(label), Busy.delay);
   try {
     return await fn();
   } catch (err) {
-    // 统一在这里报错，调用方不必到处写 alert
+    // 统一在这里报错，调用方不必到处写 alert。
+    // 用 toast 而非 alert：后者会同步阻塞渲染进程（见 toast 注释）。
     if (!err || !err.__handled) {
-      alert(`${label}失败：${err && err.message ? err.message : err}`);
+      toast(`${label}失败：${err && err.message ? err.message : err}`, 'error');
     }
     throw err;
   } finally {
     clearTimeout(showTimer);
-    Busy.depth -= 1;
+    Busy.depth = Math.max(0, Busy.depth - 1);
     if (Busy.depth === 0) busyHide();
   }
+}
+
+/**
+ * 以「独占方式」运行一段需要阻塞 UI 的工作。
+ *
+ * 与 `withBusy` 的区别：这里不做重入拒绝，而是**强制接管**——
+ * 因为调用方（如视频转码）本身可能已在别处占用计数。
+ * 无论如何都会在结束时把计数归零，杜绝泄漏。
+ */
+async function runBlocking(label, sub, fn) {
+  const saved = Busy.depth;
+  Busy.depth = Math.max(1, Busy.depth);
+  Busy.startedAt = Date.now();
+  busyShow(label, sub || '');
+  try {
+    return await fn();
+  } finally {
+    Busy.depth = saved;                  // 恢复到进入前的值
+    if (Busy.depth === 0) busyHide();
+    else busyProgress(null, '');
+  }
+}
+
+/**
+ * 非阻塞提示。
+ *
+ * 为什么不用 `alert()`：在 Electron 里它会**同步阻塞渲染进程**，
+ * 弹窗未关闭前所有定时器、轮询、动画全部冻结（实测探针直接卡死）。
+ * 对「转码进度」「任务轮询」这类后台仍在工作的场景尤其危险——
+ * 弹一个错误提示反而把后台界面更新也一起冻住。
+ *
+ * 这里改用自绘的轻提示：不阻塞、自动消失、可叠加。
+ */
+let _toastTimer = 0;
+
+function toast(message, kind = 'info', ms = 4200) {
+  let box = $('toast');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'toast';
+    box.className = 'toast';
+    document.body.appendChild(box);
+  }
+  box.textContent = message;
+  box.className = `toast show ${kind}`;
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => { box.className = 'toast'; }, ms);
+}
+
+/** 需要用户确认时用自绘对话框（替代阻塞的 confirm/alert）。 */
+function askConfirm(message) {
+  return new Promise((resolve) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'modal';
+    wrap.innerHTML = `
+      <div class="modal-box" style="width:420px">
+        <h3>请确认</h3>
+        <p class="muted small" style="white-space:pre-wrap"></p>
+        <div class="modal-actions">
+          <button class="btn act-no">取消</button>
+          <button class="btn accent act-yes">确定</button>
+        </div>
+      </div>`;
+    wrap.querySelector('p').textContent = message;
+    document.body.appendChild(wrap);
+    const close = (v) => { wrap.remove(); resolve(v); };
+    wrap.querySelector('.act-no').onclick = () => close(false);
+    wrap.querySelector('.act-yes').onclick = () => close(true);
+  });
 }
 
 // ---------------- 工具 ----------------
@@ -403,8 +487,11 @@ function setVideo(path) {
   });
   loadVideoInfo(path);
   v.onloadedmetadata = () => {
-    $('status-dur').textContent = fmt(v.duration);
-    $('seek').max = String(Math.max(1, Math.round(v.duration * 1000)));
+    // 优先用源文件时长：转码格式的前段代理只有 90 秒，
+    // 直接显示 v.duration 会让总时长看起来「变短了」。
+    const dur = S.sourceDuration || v.duration || 0;
+    $('status-dur').textContent = fmt(dur);
+    $('seek').max = String(Math.max(1, Math.round(dur * 1000)));
     drawTimeline();
     updateOverlay();
   };
@@ -424,16 +511,21 @@ async function loadVideoInfo(path) {
         $('status-backend').textContent += '（帧率估计）';
       }
     }
+    // 源文件时长是时间轴的权威值（代理片段可能只有前 90 秒）
+    if (d.duration > 0) S.sourceDuration = d.duration;
   } catch (e) {
     FPS = FPS_FALLBACK;
   }
-  // 帧率变化后重画所有时间显示
+  // 帧率/时长变化后重画所有时间显示
   renderList();
   renderClips();
   drawTimeline();
   updateOverlay();
-  if ($('status-dur').textContent) {
-    $('status-dur').textContent = fmt($('video').duration || 0);
+  // 总时长显示：优先源文件时长（代理片段会偏小）
+  const dur = S.sourceDuration || $('video').duration || 0;
+  if (dur > 0) {
+    $('status-dur').textContent = fmt(dur);
+    $('seek').max = String(Math.max(1, Math.round(dur * 1000)));
   }
 }
 
@@ -460,39 +552,40 @@ async function preparePlayable(path) {
   if (!st.needed || st.ready) return;
 
   const label = st.copyable ? '正在转换封装格式' : '正在转码视频（HEVC 需重编码）';
-  Busy.depth += 1;
-  busyShow(label, st.copyable ? '通常几秒完成' : '正在生成可预览片段…');
-  try {
-    // 触发后端开始转码（媒体请求本身会启动任务）
-    const probe = new Image();
-    probe.src = `/api/media?path=${encodeURIComponent(path)}&_t=${Date.now()}`;
-    // 轮询到「有可用片段」即放行（不是等转完）
-    const t0 = Date.now();
-    const LIMIT_MS = st.copyable ? 120000 : 180000;   // copy 2 分钟，转码 3 分钟
-    let lastP = 0;
-    while (Date.now() - t0 < LIMIT_MS) {
-      await new Promise((r) => setTimeout(r, 1200));
-      let s2;
-      try {
-        s2 = await apiJson('/api/transcode/status?path=' + encodeURIComponent(path),
-                           'GET', undefined, { silent: true });
-      } catch (e) { continue; }
-      if (s2.ready) {
-        busyProgress(1, '已可预览，后台继续转码');
-        await new Promise((r) => setTimeout(r, 350));
-        return;
+  // 用 runBlocking 而不是手工增减计数：后者一旦中途抛错就会泄漏，
+  // 之后所有操作都被拒（实测表现为「一直提示上一轮操作未完成」）。
+  await runBlocking(label,
+    st.copyable ? '通常几秒完成' : '正在生成可预览片段…',
+    async () => {
+      // 触发后端开始转码（媒体请求本身会启动任务）
+      const probe = new Image();
+      probe.src = `/api/media?path=${encodeURIComponent(path)}&_t=${Date.now()}`;
+      // 轮询到「有可用片段」即放行（不是等转完）
+      const t0 = Date.now();
+      const LIMIT_MS = st.copyable ? 120000 : 180000;
+      let lastP = 0;
+      while (Date.now() - t0 < LIMIT_MS) {
+        await new Promise((r) => setTimeout(r, 1200));
+        let s2;
+        try {
+          s2 = await apiJson(
+            '/api/transcode/status?path=' + encodeURIComponent(path),
+            'GET', undefined, { silent: true });
+        } catch (e) { continue; }
+        if (s2.ready) {
+          busyProgress(1, '已可预览，后台继续转码');
+          await new Promise((r) => setTimeout(r, 350));
+          return;
+        }
+        if (Number.isFinite(s2.progress) && s2.progress > lastP) {
+          lastP = s2.progress;
+        }
+        busyProgress(lastP || null,
+          lastP ? `已转码 ${Math.round(lastP * 100)}%` : '正在生成可预览片段…');
       }
-      if (Number.isFinite(s2.progress) && s2.progress > lastP) lastP = s2.progress;
-      busyProgress(lastP || null,
-        lastP ? `已转码 ${Math.round(lastP * 100)}%` : '正在生成可预览片段…');
-    }
-    // 超时也放行：至少让用户尝试播放，而不是一直转圈
-    busyProgress(null, '转码较慢，先尝试播放');
-    await new Promise((r) => setTimeout(r, 400));
-  } finally {
-    Busy.depth -= 1;
-    if (Busy.depth === 0) busyHide();
-  }
+      busyProgress(null, '转码较慢，先尝试播放');
+      await new Promise((r) => setTimeout(r, 400));
+    });
 }
 
 async function loadFilmstrip(path) {
@@ -572,7 +665,7 @@ function updateHistory(d) {
 
 async function startGenerate() {
   if (!S.project || !S.project.meta.video) {
-    alert('请先打开视频文件。');
+    toast('请先打开视频文件。', 'warn');
     return;
   }
   const st = settingsPayload();
@@ -618,14 +711,7 @@ async function startGenerate() {
 
 /** 轮询生成任务，同时把进度写进居中弹窗。 */
 async function pollJobWhileBusy() {
-  Busy.depth += 1;
-  busyShow('正在识别字幕', '准备中…');
-  try {
-    await pollJob();
-  } finally {
-    Busy.depth -= 1;
-    if (Busy.depth === 0) busyHide();
-  }
+  await runBlocking('正在识别字幕', '准备中…', () => pollJob());
 }
 
 async function pollJob() {
@@ -651,7 +737,7 @@ async function pollJob() {
       done = true;
       $('progress-text').textContent = '失败：' + j.error;
       busyProgress(null, '失败：' + j.error);
-      alert('识别失败：' + j.error);
+      toast('识别失败：' + j.error, 'error');
     }
   } catch (e) {
     $('progress-text').textContent = '轮询失败：' + e.message;
@@ -905,7 +991,7 @@ async function editOp(op, body) {
 async function doSplit() {
   const at = $('video').currentTime || 0;
   const idx = S.lines.findIndex((l) => at > l.start && at < l.end);
-  if (idx < 0) { alert('播放头不在任何字幕行内。'); return; }
+  if (idx < 0) { toast('播放头不在任何字幕行内。', 'warn'); return; }
   const ln = S.lines[idx];
   const ratio = (at - ln.start) / Math.max(0.01, ln.end - ln.start);
   const pos = Math.max(1, Math.min(ln.text.length - 1,
@@ -916,7 +1002,7 @@ async function doSplit() {
 
 async function doMerge() {
   const idx = [...S.selection].sort((a, b) => a - b);
-  if (idx.length < 2) { alert('请用 Ctrl/Shift 选中至少两行。'); return; }
+  if (idx.length < 2) { toast('请用 Ctrl/Shift 选中至少两行。', 'warn'); return; }
   await editOp('merge', { indices: idx });
   S.selection.clear();
   await saveNow('merge');
@@ -924,7 +1010,7 @@ async function doMerge() {
 
 async function doDelete() {
   const idx = [...S.selection];
-  if (!idx.length) { alert('请先选中要删除的行。'); return; }
+  if (!idx.length) { toast('请先选中要删除的行。', 'warn'); return; }
   await editOp('delete', { indices: idx });
   S.selection.clear();
   await saveNow('delete');
@@ -946,13 +1032,13 @@ async function doQc() {
 
 async function doCopy() {
   const idx = [...S.selection];
-  if (!idx.length) { alert('请先选中要复制的行。'); return; }
+  if (!idx.length) { toast('请先选中要复制的行。', 'warn'); return; }
   const d = await editOp('copy', { indices: idx });
   $('progress-text').textContent = d.message;
 }
 
 async function doPaste() {
-  if (!S.clipboard.length) { alert('剪贴板为空，请先复制。'); return; }
+  if (!S.clipboard.length) { toast('剪贴板为空，请先复制。', 'warn'); return; }
   const at = $('video').currentTime || 0;
   await editOp('paste', { clipboard: S.clipboard, at });
   await saveNow('paste');
@@ -960,7 +1046,7 @@ async function doPaste() {
 
 async function doDuplicate() {
   const idx = [...S.selection];
-  if (!idx.length) { alert('请先选中要复制的行。'); return; }
+  if (!idx.length) { toast('请先选中要复制的行。', 'warn'); return; }
   await editOp('duplicate', { indices: idx });
   await saveNow('duplicate');
 }
@@ -983,8 +1069,20 @@ async function doRedo() {
 
 // ---------------- 时间轴（多轨 + 缩放 + 拖动） ----------------
 
+/**
+ * 时间轴总时长（权威来源是**源文件**，不是 <video> 元素）。
+ *
+ * 为什么不能用 `video.duration`：需要转码的格式（FLV/HEVC 等）会先播
+ * 「前段代理」（默认 90 秒），此时 `video.duration` 只有 90——时间轴、
+ * 时间码、播放头全部按 90 秒算，而生成的字幕覆盖整片几小时，于是完全
+ * 对不上。用户看到的现象就是「处理完不能正常使用」。
+ *
+ * 因此以 `/api/videoinfo` 探测到的**源文件时长**为准：它由 ffprobe 从
+ * 原始文件读出，不受代理片段影响。
+ */
 function timelineDuration() {
-  return ($('video').duration || 0)
+  return S.sourceDuration
+    || ($('video').duration || 0)
     || S.lines.reduce((m, l) => Math.max(m, l.end), 0) || 600;
 }
 
@@ -1264,7 +1362,7 @@ function runAction(id) {
 // ---------------- 导出（自选路径） ----------------
 
 async function showExport() {
-  if (!S.project) { alert('请先打开视频或新建项目。'); return; }
+  if (!S.project) { toast('请先打开视频或新建项目。', 'warn'); return; }
   const name = S.project.meta.name || 'subtitle';
   $('exp-name').value = name;
   $('exp-dir').value = '';
@@ -1274,7 +1372,7 @@ async function showExport() {
 async function doExport() {
   const fmts = [...$('exp-fmts').querySelectorAll('input:checked')]
     .map((c) => c.value);
-  if (!fmts.length) { alert('请至少选择一种格式。'); return; }
+  if (!fmts.length) { toast('请至少选择一种格式。', 'warn'); return; }
   await saveNow('pre-export');
   const body = { fmt: fmts, name: ($('exp-name').value || 'subtitle').trim() };
   const dir = ($('exp-dir').value || '').trim();
@@ -1286,7 +1384,7 @@ async function doExport() {
       `已导出 ${d.files.length} 个文件到 ${d.out_dir}`;
     if (window.desktop && d.files.length) window.desktop.reveal(d.files[0]);
   } catch (e) {
-    alert('导出失败：' + e.message);
+    toast('导出失败：' + e.message, 'error');
   }
 }
 
@@ -1336,7 +1434,7 @@ async function showDrafts() {
     const id = item.dataset.id;
     item.querySelector('.act-open').onclick = () => openProject(id);
     item.querySelector('.act-del').onclick = async () => {
-      if (!confirm('确认删除该项目？')) return;
+      if (!(await askConfirm('确认删除该项目？'))) return;
       await apiJson(`/api/projects/${id}`, 'DELETE');
       item.remove();
     };
@@ -1363,7 +1461,7 @@ async function openProject(id) {
   try {
     const rec = await apiJson(`/api/projects/${id}/recover`, 'POST', {});
     if (rec.lines && rec.lines.length !== S.lines.length
-        && confirm('检测到自动保存的版本与上次保存不一致，是否恢复？')) {
+        && (await askConfirm('检测到自动保存的版本与上次保存不一致，是否恢复？'))) {
       S.lines = rec.lines;
     }
   } catch (e) { /* 无 autosave */ }
@@ -1377,12 +1475,14 @@ async function openProject(id) {
 
 async function cleanCache() {
   const stats = await apiJson('/api/cache/stats');
-  if (!confirm(`当前缓存约 ${stats.freed_mb} MB / ${stats.files} 个文件。\n`
+  const ok = await askConfirm(
+    `当前缓存约 ${stats.freed_mb} MB / ${stats.files} 个文件。\n`
     + '将清理 7 天前的中间产物（抽取音频、缩略图等）。\n'
-    + '不会删除字幕、声纹、歌词库。继续？')) return;
+    + '不会删除字幕、声纹、歌词库。继续？');
+  if (!ok) return;
   const d = await apiJson('/api/cache/clean', 'POST',
     { max_age_days: 7, max_total_mb: 2048 });
-  alert(`已清理 ${d.files} 个文件，释放约 ${d.freed_mb} MB。`);
+  toast(`已清理 ${d.files} 个文件，释放约 ${d.freed_mb} MB。`, 'ok');
 }
 
 async function importDanmaku() {
@@ -1525,7 +1625,7 @@ async function refreshLyricList() {
         $('ly-status').textContent = `已把《${title}》加入本场曲目`;
       };
       item.querySelector('.act-del').onclick = async () => {
-        if (!confirm(`从曲库删除《${title}》？`)) return;
+        if (!(await askConfirm(`从曲库删除《${title}》？`))) return;
         await apiJson('/api/lyrics/library/remove', 'POST', { title });
         await refreshLyricList();
       };
@@ -2072,12 +2172,12 @@ async function refreshVoiceList() {
         setSaveState(`已选用声纹「${name}」`, 'ok');
       };
       item.querySelector('.act-del').onclick = async () => {
-        if (!confirm(`删除声纹「${name}」？`)) return;
+        if (!(await askConfirm(`删除声纹「${name}」？`))) return;
         try {
           await apiJson('/api/profiles/delete', 'POST', { name });
           await refreshVoiceList();
           await loadProfiles();
-        } catch (e) { alert('删除失败：' + e.message); }
+        } catch (e) { toast('删除失败：' + e.message, 'error'); }
       };
     });
   } catch (e) {
@@ -2153,7 +2253,7 @@ function bindEvents() {
   $('exp-cancel').onclick = () => $('modal-export').classList.add('hidden');
   $('exp-ok').onclick = doExport;
   $('exp-browse').onclick = async () => {
-    if (!window.desktop) { alert('浏览器模式下请直接输入绝对路径。'); return; }
+    if (!window.desktop) { toast('浏览器模式下请直接输入绝对路径。', 'warn'); return; }
     const dir = await window.desktop.chooseDir();
     if (dir) $('exp-dir').value = dir;
   };

@@ -33,7 +33,9 @@ def main() -> int:
     dynamic_classes = {"draft-item", "act-open", "act-del", "line",
                        "row", "row-idx", "row-text", "row-time", "clip",
                        "item", "edge", "sep", "keys-row",
-                       "vp-item", "act-use", "act-edit"}
+                       "vp-item", "act-use", "act-edit",
+                       # 自绘确认框（askConfirm）动态创建的按钮
+                       "act-yes", "act-no", "toast"}
     missing_classes = sorted(js_classes - html_classes - dynamic_classes)
 
     print(f"HTML 元素 ID: {len(html_ids)}")

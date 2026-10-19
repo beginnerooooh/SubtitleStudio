@@ -674,7 +674,7 @@ def test_hevc_is_not_browser_safe():
 
 
 def test_transcode_args_skip_copy_for_unsafe_codec():
-    """回归：编码不安全时不能只 remux。"""
+    """回归：编码不安全时不能只 remux，且重编码必须带缩放滤镜。"""
     import desktop_server as ds
 
     safe = ds._transcode_args(None, can_copy=True)
@@ -682,6 +682,9 @@ def test_transcode_args_skip_copy_for_unsafe_codec():
     unsafe = ds._transcode_args(None, can_copy=False)
     assert all("copy" not in a for a in unsafe), \
         "编码不安全时必须重编码，不能 copy"
+    # 重编码路径必须缩到预览规格（540p30），否则 1080p60 要慢一倍
+    assert any("-vf" in a for a in unsafe), "重编码必须带 -vf 缩放"
+    assert any(ds.PREVIEW_VF in a for a in unsafe), "应使用 PREVIEW_VF 规格"
 
 
 # ---------------- 阻塞进度层（防重复点击） ----------------
@@ -731,6 +734,143 @@ def test_codec_probe_is_cached_and_bounded():
     assert "_CODEC_CACHE" in src, "编码探测必须缓存"
     assert "-analyzeduration" in src and "-probesize" in src, \
         "必须限制 ffprobe 扫描范围，否则大文件极慢"
+
+
+# ---------------- 效率相关回归 ----------------
+
+def test_cache_key_is_process_stable():
+    """回归：缓存键必须跨进程稳定。
+
+    这是「每次打开都重新转码半小时」的根因：Python 的 `hash()` 对
+    字符串按进程随机加盐，三次独立进程会给出三个不同的键。
+    """
+    import inspect
+
+    import desktop_server as ds
+
+    src = inspect.getsource(ds._cache_key)
+    assert "hashlib" in src, "必须用 hashlib 生成稳定键"
+    # 同一输入在同一进程内必须稳定
+    assert ds._cache_key("a", 1, 2.0) == ds._cache_key("a", 1, 2.0)
+    # 不同输入必须不同
+    assert ds._cache_key("a") != ds._cache_key("b")
+
+
+def test_file_key_uses_size_and_mtime():
+    import desktop_server as ds
+    from pathlib import Path
+
+    p = Path(__file__)
+    k1 = ds._file_key(p)
+    assert isinstance(k1, str) and len(k1) >= 16
+    # 额外参数应改变键（缩略图/转码互不覆盖）
+    assert ds._file_key(p, "thumbs") != ds._file_key(p, "transcode")
+
+
+def test_asr_defaults_are_speed_tuned():
+    """回归：默认值必须是实测验证过的提速组合。"""
+    from core.config import AsrConfig
+
+    cfg = AsrConfig()
+    # beam=1 实测又快又准（见 config 注释中的对照表）
+    assert cfg.beam_size == 1, "beam_size 应为 1（贪心，实测更准且快 1.8 倍）"
+    assert cfg.best_of == 1, "best_of 应为 1"
+    # chunk=120 避免 whisper 在长块上静默跳段（1200s 时 CER 0.721）
+    assert cfg.chunk_seconds == 120.0, "chunk_seconds 应为 120 秒"
+    assert cfg.vad_filter is False, "VAD 必须默认关闭（否则吞掉歌声）"
+
+
+def test_preview_proxy_is_downscaled():
+    """回归：预览代理必须降规格，否则 1080p60 转码慢一倍。"""
+    import desktop_server as ds
+
+    assert "540" in ds.PREVIEW_VF, "预览代理应缩到 540p"
+    assert "fps=30" in ds.PREVIEW_VF, "预览代理应降到 30fps"
+
+
+def test_encoder_detection_prefers_hardware():
+    """回归：编码器探测应优先硬件（NVENC/QSV/AMF），最后才 CPU。"""
+    import inspect
+
+    import desktop_server as ds
+
+    src = inspect.getsource(ds._pick_encoder)
+    for hw in ("h264_nvenc", "h264_qsv", "h264_amf"):
+        assert hw in src, f"应尝试 {hw}"
+    assert "libx264" in src, "应有 CPU 兜底"
+    # NVENC 必须排在 libx264 之前（硬件优先）
+    assert src.index("h264_nvenc") < src.index("libx264")
+
+def test_hwaccel_detection_exists():
+    import inspect
+
+    import desktop_server as ds
+
+    src = inspect.getsource(ds._pick_hwaccel)
+    assert "cuda" in src
+    # 必须有无硬件时的空列表兜底
+    assert "_HWACCEL_ARGS = []" in src
+
+
+def test_transcode_outputs_are_separate_files():
+    """回归：前段与完整版必须是不同文件。
+
+    Windows 下覆盖正在被 HTTP 流读取的文件会失败（os.replace 报
+    文件被占用），导致「后台转完了但用户仍只有前段」。
+    """
+    import inspect
+
+    import desktop_server as ds
+
+    # _serve_transcoded 是 Handler 的方法，从类上取源码
+    src = inspect.getsource(ds.Handler._serve_transcoded)
+    assert ".head.mp4" in src, "前段应使用独立的 .head.mp4"
+    assert "full" in src, "应有完整版路径"
+    # 不应再用「完整版覆盖前段」的写法
+    assert "out.with_suffix" not in src, \
+        "前段与完整版必须是两个文件，不能互相覆盖"
+
+
+def test_stale_transcode_sweep_skips_active_jobs():
+    """回归：清理残留临时文件时必须跳过正在写入的。"""
+    import inspect
+
+    import desktop_server as ds
+
+    src = inspect.getsource(ds._sweep_stale_transcode)
+    assert "_TRANSCODE_JOBS" in src, "必须检查活跃任务"
+    assert "active" in src, "必须跳过正在写入的文件"
+
+
+def test_timeline_uses_source_duration():
+    """回归：时间轴时长必须用源文件时长，而非 <video>.duration。
+
+    转码格式只播前段代理（90 秒）时，若按 video.duration 渲染，
+    生成的字幕会与时间轴完全错位。
+    """
+    js = _desktop_file("app.js")
+    assert "sourceDuration" in js, "必须记录源文件时长"
+    seg = js[js.index("function timelineDuration"):]
+    seg = seg[: seg.index("\n}")]
+    assert "S.sourceDuration" in seg, \
+        "timelineDuration 必须优先使用 S.sourceDuration"
+
+
+def test_non_blocking_toast_replaces_alert():
+    """回归：不应再使用阻塞式 alert/confirm。
+
+    在 Electron 中 alert() 会同步阻塞渲染进程，弹窗未关时所有定时器、
+    轮询、动画全部冻结。
+    """
+    js = _desktop_file("app.js")
+    assert "function toast" in js and "function askConfirm" in js
+    # 业务代码里不应残留 alert( 调用（注释与函数定义除外）
+    code = "\n".join(ln for ln in js.splitlines()
+                     if not ln.strip().startswith("*")
+                     and not ln.strip().startswith("//"))
+    assert "alert(" not in code, "仍有阻塞式 alert 调用"
+    assert "confirm(" not in code.replace("askConfirm(", ""), \
+        "仍有阻塞式 confirm 调用"
 
 
 # ---------------- 弹幕 XML ----------------

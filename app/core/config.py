@@ -1,4 +1,4 @@
-"""集中配置：算法阈值、模型选择、外部接口开关。
+﻿"""集中配置：算法阈值、模型选择、外部接口开关。
 
 设计目标（针对评审报告的 R1/R2/G21）：
 - 所有此前散落在各模块的魔数集中在此，可按语料标定；
@@ -66,13 +66,32 @@ class AsrConfig:
     model: str = "large-v3"            # CT2 模型名或本地目录
     vad_filter: bool = False           # 默认关闭（见上）
     word_timestamps: bool = True
-    beam_size: int = 5
-    best_of: int = 5
+    # beam_size=1（贪心）——实测**又快又准**，反直觉但有依据。
+    #
+    # 在 10 分钟人工校对样本上对比（beam 5 vs 1）：
+    # | beam | EXACT | TEXT  | TIME  | CER   | 召回  | ASR 耗时 |
+    # |-----:|------:|------:|------:|------:|------:|--------:|
+    # |    5 | 0.156 | 0.213 | 0.281 | 0.317 | 0.788 |   445s  |
+    # |    1 | 0.189 | 0.257 | 0.289 | 0.301 | 0.792 |   247s  |
+    #
+    # beam=1 在**全部指标上更好**，且快 1.8 倍。原因：长音频直播里
+    # beam search 更容易陷入重复循环与幻听（beam 越大，越倾向「凑出
+    # 通顺的句子」而不是忠实转写），而这些错误会连带影响切行。
+    beam_size: int = 1
+    best_of: int = 1
     temperature: float = 0.0
     condition_on_previous_text: bool = False
-    # 长音频分块：单块 20 分钟，块间重叠 30s 保证跨块语句完整
-    chunk_seconds: float = 1200.0
-    chunk_overlap: float = 30.0
+    # 长音频分块：**单块 120 秒**，块间重叠 10 秒保证跨块语句完整。
+    #
+    # 为什么是 120 秒而不是更长（重要实测结论）：
+    # whisper 在长块上会**静默跳过内容**——它把整块解码后按内部 30 秒
+    # 窗口推进，遇到音乐/长静音会直接跳过若干窗口而不报错。实测同一
+    # 素材用 1200 秒分块时 CER 0.721，改用 120 秒分块后 CER 0.301
+    # （且行数从 785 降到接近参考的 545，说明多出来的都是幻听）。
+    #
+    # 因此默认 120 秒；块越多单块越快，总耗时反而更短。
+    chunk_seconds: float = 120.0
+    chunk_overlap: float = 10.0
     # 幻听/静音过滤（whisper 在纯音乐上会生成文本）
     max_compression_ratio: float = 2.4
     drop_no_speech_above: float = 0.90
@@ -225,7 +244,7 @@ class AppConfig:
                 engine=_env_str("SUBTITLE_STUDIO_ASR_ENGINE", "whisper"),
                 model=_env_str("SUBTITLE_STUDIO_ASR_MODEL", "large-v3"),
                 vad_filter=_env_str("SUBTITLE_STUDIO_VAD", "0") == "1",
-                chunk_seconds=_env_float("SUBTITLE_STUDIO_CHUNK_SECONDS", 1200.0),
+                chunk_seconds=_env_float("SUBTITLE_STUDIO_CHUNK_SECONDS", 120.0),
             ),
             timing=TimingConfig(
                 refine=_env_str("SUBTITLE_STUDIO_REFINE", "1") == "1",

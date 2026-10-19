@@ -31,6 +31,10 @@ _STAGE_BASE = {"extract": 0.00, "separate": 0.05, "analyze": 0.30,
 _STAGE_SPAN = {"extract": 0.05, "separate": 0.25, "analyze": 0.15,
                "recognize": 0.47, "export": 0.08}
 
+# 识曲连续失败多少次后停用。识曲是网络调用（单次最长 25 秒超时），
+# 无网络时逐块重试会浪费大量时间，因此熔断。
+SHAZAM_FAIL_LIMIT = 3
+
 
 class PipelineError(RuntimeError):
     """流水线失败（用户可读消息）。"""
@@ -94,6 +98,9 @@ class Pipeline:
         self.warnings: list[str] = []
         self.timings: dict[str, float] = {}
         self._stage = ""
+        # 识曲熔断：连续失败达阈值后停用（避免无网络时白等大量超时）
+        self._shazam_fails = 0
+        self._shazam_disabled = False
 
     # ---------------- 入口 ----------------
 
@@ -565,12 +572,21 @@ class Pipeline:
 
     def _shazam_song(self, wav: str, start: float, end: float
                      ) -> Optional[dict]:
-        """Shazam 识曲（多位置探测，翻唱命中率低，仅作补充）。"""
+        """Shazam 识曲（多位置探测，翻唱命中率低，仅作补充）。
+
+        效率保护：Shazam 是**网络**调用，单次最长等 25 秒。
+        若连续多次失败（无网络 / 被限流），继续逐块重试只会让整个任务
+        卡在无意义的超时上——实测 72 分钟素材最多会浪费十几分钟。
+        因此失败累积到阈值后直接停用识曲（后续块不再调用）。
+        """
+        if self._shazam_disabled:
+            return None
         import asyncio
 
         try:
             from shazamio import Shazam
         except ImportError:
+            self._shazam_disabled = True
             return None
         snippet = min(self.cfg.song.shazam_snippet, max(6.0, end - start))
         # 探测位置：块内均匀取 shazam_probes 个点（翻唱常在副歌才被识别到）
@@ -589,10 +605,17 @@ class Pipeline:
                 try:
                     raw = await asyncio.wait_for(sh.recognize(clip), timeout=25)
                 except Exception:
+                    self._shazam_fails += 1
+                    if self._shazam_fails >= SHAZAM_FAIL_LIMIT:
+                        self._shazam_disabled = True
+                        self._log("识曲连续失败，已跳过后续识曲"
+                                  "（歌词库检索不受影响）")
+                        return None
                     continue
                 track = (raw or {}).get("track") or {}
                 title = (track.get("title") or "").strip()
                 if title:
+                    self._shazam_fails = 0
                     return {"title": title,
                             "artist": (track.get("subtitle") or "").strip(),
                             "lyrics": "", "synced": False, "source": "shazam",
@@ -602,6 +625,9 @@ class Pipeline:
         try:
             return asyncio.run(probe())
         except Exception:
+            self._shazam_fails += 1
+            if self._shazam_fails >= SHAZAM_FAIL_LIMIT:
+                self._shazam_disabled = True
             return None
 
     def _align_song(self, wav: str, seg, transcript: str) -> None:

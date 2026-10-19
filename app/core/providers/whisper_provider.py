@@ -1,4 +1,4 @@
-"""本地 whisper 后端：faster-whisper / CTranslate2。
+﻿"""本地 whisper 后端：faster-whisper / CTranslate2。
 
 关键实现决策（均来自本项目实测，见 docs/EVALUATION.md）：
 1. 默认 **关闭 VAD 过滤**：Silero VAD 会把歌声与弱起句整段判为非语音，
@@ -111,11 +111,11 @@ class WhisperProvider(ASRProvider):
         models_dir: str = "models",
         vad_filter: bool = False,
         word_timestamps: bool = True,
-        beam_size: int = 5,
-        best_of: int = 5,
+        beam_size: int = 1,
+        best_of: int = 1,
         temperature: float = 0.0,
         condition_on_previous_text: bool = False,
-        chunk_seconds: float = 1200.0,
+        chunk_seconds: float = 120.0,
         chunk_overlap: float = 30.0,
         initial_prompt: str = "",
         detect_default_language: str = "zh",
@@ -145,6 +145,22 @@ class WhisperProvider(ASRProvider):
         duration = total_duration or _wav_duration(wav_path)
         plans = _plan_chunks(duration, self.chunk_seconds, self.chunk_overlap)
         out: list[AsrSegment] = []
+
+        # 为什么不用并行解码（实测结论，避免后人重复踩坑）
+        # ────────────────────────────────────────────
+        # 曾尝试 ThreadPoolExecutor(max_workers=2) 并行提交分块，期望填补
+        # GPU 空隙。实测**反而更慢**：10 分钟素材从 72s 涨到 164s（2.3 倍）。
+        # 原因是 CTranslate2 的 GPU 推理本身已吃满算力，并发只会造成
+        # 显存争抢与上下文切换；`generate` 内部还有锁，实际仍是串行，
+        # 却多付了调度开销。
+        #
+        # 因此保持串行。真正的提速手段是 beam_size（见 AsrConfig 注释）。
+        return self._run_serial(wav_path, plans, language, on_progress,
+                                duration, out)
+
+    def _run_serial(self, wav_path, plans, language, on_progress, duration,
+                    out) -> list[AsrSegment]:
+        """串行解码分块（顺序稳定，GPU 利用率最高）。"""
         for idx, (start, end, keep_s, keep_e) in enumerate(plans):
             self._check_cancel()
             span = 1.0 / max(1, len(plans))
