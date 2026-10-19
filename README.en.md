@@ -1,4 +1,4 @@
-# Subtitle Studio
+﻿# Subtitle Studio
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
@@ -63,6 +63,56 @@ song requests in chat  →  local lyric library  →  online sources (NetEase / 
 
 Online sources support **automatic fallback**: if the best match from one source has the wrong
 artist, the next source is tried. A self-hosted lyric service can also be plugged in.
+
+### Lyric Library & Text Correction
+
+Recognition accuracy on **singing** is noticeably lower than on speech (sustained vowels,
+instrumental interference). But song text is known, so there is a correction path independent
+of recognition:
+
+```
+Lyric library (import .lrc / .txt / .srt, or fetch online by title + artist)
+   ↓  order-aware similarity matching against the subtitles (limited skips allowed)
+   ↓  high-confidence matches → replace recognised text with the canonical lyric
+```
+
+- **Lyrics inform line breaking too** — subtitles break at the lyric's own phrase boundaries,
+  so line timing and length follow the song rather than being patched afterwards
+- **Only replaces lines where the lyric is clearly more reliable** — the score must pass a
+  threshold *and* the lyric must not be shorter than the recognised text, so extra recognised
+  content is never discarded
+- **Inner breaks use spaces** — when a line must be split internally, a space is inserted
+  rather than introducing punctuation
+
+### Chat-Based Correction
+
+In livestreams, chat/gifts/SC frequently **repeat what the streamer just said or named**
+(chat spam, song requests, thank-yous). These are time-aligned external text sources:
+
+- **Time-weighted** — chat close to the subtitle carries more weight, since audience reactions
+  are near-synchronous
+- **Homophone fixes** — when recognition mishears a proper noun (e.g. 翠翠沙 for 脆脆鲨), the
+  spelling that recurs in chat replaces it
+- **Text only, never the timeline** — with a safety valve that abandons the whole pass if more
+  than half the lines would change
+- Parses **user IDs, nicknames, gift names, chat text, and SC messages**
+
+### Manual Song List
+
+You can enter every song performed in this stream:
+
+- Drives lyric-library lookup directly instead of relying on fingerprinting
+- Narrows the BGM decision space, **substantially reducing false "original vocal" flags**
+- Serves as the lyric source for line breaking, so subtitles split at the right phrases
+
+### Video Format Support
+
+Chromium can only play its own container set (MP4 / WebM / Ogg). For **FLV, MKV, TS, AVI,
+WMV, RMVB** and similar formats, the backend transcodes to a `faststart` MP4 and caches it:
+
+- Prefers `-c copy` remux (roughly 0.1–2.4 s for a 20-second clip, lossless)
+- Falls back to re-encoding when codecs are incompatible
+- Cache is keyed by path + mtime + size, so reopening is instant
 
 ### Editing
 
@@ -252,6 +302,9 @@ extra dependencies. The desktop and web UIs share the same logic.
 | `POST /api/generate` · `GET /api/jobs/<id>` | Async generation jobs and progress polling |
 | `POST /api/evaluate` | Evaluation |
 | `GET/POST /api/lyrics/*` | Lyric source list, search, self-hosted endpoint |
+| `GET /api/lyrics/library` | Lyric library listing |
+| `POST /api/lyrics/library/{add,fetch,remove}` | Import / fetch / delete lyrics |
+| `GET /api/lyrics/match` | Preview matching of subtitles against a lyric |
 | `GET /api/media?path=` | Media stream (Range supported) |
 | `GET /api/videoinfo?path=` | Frame rate and duration (for timecode) |
 | `GET /api/thumbs?path=` | Timeline filmstrip thumbnails |
@@ -301,6 +354,8 @@ app/
     bgm.py               Multi-factor BGM detection
     song.py              Song detection / multi-source lyric search / forced alignment
     streamer.py          Single-target voiceprint (speech + singing)
+    lyrics_library.py    Lyric library (import/fetch) + subtitle similarity correction
+    danmaku_correct.py   Chat-based correction (proper nouns / homophones)
     livexml.py           Chat / gift / SC / guard XML parsing
     store.py             Projects / drafts / undo / autosave / cache cleanup
     evaluate.py          Evaluation and boundary-case analysis
@@ -319,7 +374,7 @@ desktop/                 Electron desktop app
 docs/EVALUATION.md       Evaluation report (root-cause analysis and reproduction)
 tools/cli.py             Command line
 tools/check_desktop_ids.py  Desktop DOM element ID consistency check
-tests/test_core_v2.py    Unit tests (80 cases, no GPU required)
+tests/test_core_v2.py    Unit tests (93 cases, no GPU required)
 ```
 
 ---

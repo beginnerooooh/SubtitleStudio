@@ -362,7 +362,15 @@ async function startGenerate() {
              chunk_overlap: Math.max(4, st.chunk_seconds * 0.08) },
       timing: { refine: st.refine },
       segment: { use_punctuation: st.use_punctuation },
-      song: { enabled: st.songs },
+      song: {
+        enabled: st.songs,
+        // 手动录入的本场曲目：逗号/顿号/空白分隔
+        manual_titles: ($('manual-titles').value || '')
+          .split(/[,，、\n]/).map((x) => x.trim()).filter(Boolean),
+        lyric_correct: $('opt-lyric-correct').checked,
+        danmaku_correct: $('opt-danmaku-correct').checked,
+        segment_by_lyrics: true,
+      },
       voiceprint: { enabled: st.voiceprint, profile_name: st.profile_name,
                     bgm_policy: st.bgm_policy },
     },
@@ -1230,6 +1238,114 @@ function renderBgm(flags) {
     </div>`).join('');
 }
 
+// ---------------- 歌词库 ----------------
+
+async function openLyrics() {
+  $('modal-lyrics').classList.remove('hidden');
+  await refreshLyricList();
+}
+
+async function refreshLyricList() {
+  try {
+    const d = await apiJson('/api/lyrics/library');
+    $('ly-count').textContent = `（${d.size} 首）`;
+    const box = $('ly-list');
+    if (!d.docs.length) {
+      box.innerHTML = '<p class="muted small">曲库为空。用上方按钮导入或拉取歌词。</p>';
+      return;
+    }
+    box.innerHTML = d.docs.map((doc) => `
+      <div class="vp-item" data-title="${escapeHtml(doc.title)}"
+           data-artist="${escapeHtml(doc.artist)}">
+        <span class="name">《${escapeHtml(doc.title)}》
+          ${doc.artist ? escapeHtml(doc.artist) : ''}</span>
+        <span class="tags">${doc.line_count} 行${doc.synced ? ' · 带时间' : ''}</span>
+        <button class="btn sm act-use">加入本场</button>
+        <button class="btn sm act-del">删除</button>
+      </div>`).join('');
+    box.querySelectorAll('.vp-item').forEach((item) => {
+      const title = item.dataset.title;
+      item.querySelector('.act-use').onclick = () => {
+        const cur = ($('manual-titles').value || '').trim();
+        const parts = cur ? cur.split(/[,，、]/).map((s) => s.trim()).filter(Boolean) : [];
+        if (!parts.includes(title)) parts.push(title);
+        $('manual-titles').value = parts.join('，');
+        $('ly-status').textContent = `已把《${title}》加入本场曲目`;
+      };
+      item.querySelector('.act-del').onclick = async () => {
+        if (!confirm(`从曲库删除《${title}》？`)) return;
+        await apiJson('/api/lyrics/library/remove', 'POST', { title });
+        await refreshLyricList();
+      };
+    });
+  } catch (e) {
+    $('ly-list').innerHTML =
+      `<p class="muted small">读取失败：${escapeHtml(e.message)}</p>`;
+  }
+}
+
+async function fetchLyric() {
+  const title = ($('ly-title').value || '').trim();
+  const artist = ($('ly-artist').value || '').trim();
+  if (!title) { $('ly-status').textContent = '请先填写歌名'; return; }
+  $('ly-status').textContent = '正在拉取…';
+  try {
+    const d = await apiJson('/api/lyrics/library/fetch', 'POST',
+      { title, artist });
+    if (d.added && d.added.length) {
+      $('ly-status').textContent =
+        `已添加 ${d.added.length} 首：${d.added.map((x) => `《${x.title}》`).join('')}`;
+    } else {
+      $('ly-status').textContent = d.error || '没有找到可用歌词';
+    }
+    if (d.log && d.log.length) {
+      $('log').textContent = d.log.join('\n');
+    }
+    await refreshLyricList();
+  } catch (e) {
+    $('ly-status').textContent = '拉取失败：' + e.message;
+  }
+}
+
+async function importLyricFile() {
+  if (!window.desktop) { $('ly-status').textContent = '浏览器模式请用粘贴导入'; return; }
+  const path = await window.desktop.openFile('lyrics');
+  if (!path) return;
+  $('ly-status').textContent = '正在导入…';
+  try {
+    const d = await apiJson('/api/lyrics/library/add', 'POST', { path });
+    $('ly-status').textContent = `已导入《${d.title}》（${d.line_count} 行）`;
+    await refreshLyricList();
+  } catch (e) {
+    $('ly-status').textContent = '导入失败：' + e.message;
+  }
+}
+
+async function pasteLyric() {
+  const ta = $('ly-text');
+  if (ta.classList.contains('hidden')) {
+    ta.classList.remove('hidden');
+    ta.focus();
+    $('ly-status').textContent = '粘贴歌词后再次点击「粘贴导入」';
+    return;
+  }
+  const title = ($('ly-title').value || '').trim();
+  const artist = ($('ly-artist').value || '').trim();
+  const text = ta.value.trim();
+  if (!title) { $('ly-status').textContent = '请先填写歌名'; return; }
+  if (!text) { $('ly-status').textContent = '请先粘贴歌词内容'; return; }
+  try {
+    const d = await apiJson('/api/lyrics/library/add', 'POST',
+      { title, artist, text });
+    $('ly-status').textContent = `已导入《${d.title}》（${d.line_count} 行）`;
+    ta.value = '';
+    ta.classList.add('hidden');
+    await refreshLyricList();
+  } catch (e) {
+    $('ly-status').textContent = '导入失败：' + e.message;
+  }
+}
+
 // ---------------- 面板分隔条（可拉伸，但不影响视频预览） ----------------
 
 const LAYOUT_KEY = 'ss.layout';
@@ -1754,6 +1870,13 @@ function bindEvents() {
   $('vp-refresh').onclick = refreshVoiceList;
   $('vp-speak-drop').onclick = () => pickVoiceSample('speak');
   $('vp-sing-drop').onclick = () => pickVoiceSample('sing');
+
+  // 歌词库
+  $('btn-lyrics').onclick = openLyrics;
+  $('ly-close').onclick = () => $('modal-lyrics').classList.add('hidden');
+  $('ly-fetch').onclick = fetchLyric;
+  $('ly-import').onclick = importLyricFile;
+  $('ly-paste').onclick = pasteLyric;
   // 拖入音频文件
   for (const kind of ['speak', 'sing']) {
     const drop = $(kind === 'speak' ? 'vp-speak-drop' : 'vp-sing-drop');

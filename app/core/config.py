@@ -47,6 +47,8 @@ class SegmentConfig:
     w_duration: float = 0.5
     pause_gap: float = 0.28
     use_punctuation: bool = True   # 用标点模型提供断句线索（不进入字幕文本）
+    # 强行在一行内部断开时用空格分隔（不引入逗号等标点）
+    inner_space: bool = True
 
 
 @dataclass
@@ -118,6 +120,32 @@ class SongConfig:
     # 识曲/检索失败时，用 ASR 文本在本地/在线歌词库中检索
     search_by_transcript: bool = True
     accept_score: float = 0.55
+
+    # ---- 手动录入的本场演唱曲目 ----
+    # 由用户显式给出「这场直播唱了哪些歌」，用于：
+    #   1) 直接驱动歌词库检索（不必靠识曲猜）
+    #   2) 缩小 BGM 判定的搜索范围，降低误判
+    # 空白分隔的字符串或列表均可。
+    manual_titles: tuple = ()
+    # 给出清单后，是否只在该清单范围内判定 BGM（更保守，误判更少）
+    restrict_bgm_to_manual: bool = False
+
+    # ---- 歌词库校正（生成完成后执行）----
+    # 用曲库歌词与识别文本做相似度匹配，高置信行优先采用歌词原文
+    lyric_correct: bool = False
+    lyric_library_dir: str = "lyrics"
+    # 断句阶段就参考歌词（比事后替换更自然：行的时间与长度跟着歌词走）
+    segment_by_lyrics: bool = True
+    # 整体相似度低于此值认为「不是同一首歌」，不做校正
+    lyric_doc_threshold: float = 0.55
+    # 单行替换门槛：歌词行需明显更可靠才替换
+    lyric_line_threshold: float = 0.75
+
+    # ---- 弹幕旁路校正（生成完成后执行）----
+    # 用弹幕/礼物/SC 的反复写法纠正专名（昵称、歌名、术语）
+    danmaku_correct: bool = False
+    danmaku_time_window: float = 12.0
+    danmaku_min_corroboration: int = 2
 
 
 @dataclass

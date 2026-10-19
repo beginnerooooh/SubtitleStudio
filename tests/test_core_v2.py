@@ -488,6 +488,176 @@ def test_clip_edges_have_distinct_colors():
     assert l != r, "左右拖拽线颜色必须不同"
 
 
+def test_selected_clip_keeps_primary_color():
+    """回归：选中片段保持主色（蓝），不整体变成强调色。"""
+    css = _desktop_file("style.css")
+    seg = css[css.index(".clip.selected"):]
+    seg = seg[: seg.index("}") + 1]
+    assert "background: var(--clip)" in seg, \
+        "选中态必须保持主色，只用描边/阴影区分"
+
+
+# ---------------- 歌词库 ----------------
+
+def test_lyric_library_parse_lrc_and_plain():
+    from core.lyrics_library import parse_lyric_text
+
+    lrc = "[00:12.00]要多努力才走得到远方\n[00:18.50]如果梦想不曾坠落悬崖"
+    doc = parse_lyric_text(lrc, title="最初的梦想", artist="范玮琪")
+    assert doc.synced is True and doc.line_count == 2
+    assert doc.lines[0].time == pytest.approx(12.0)
+    assert doc.lines[1].text.startswith("如果梦想")
+
+    plain = "第一行歌词\n第二行歌词\n"
+    d2 = parse_lyric_text(plain, title="无时间")
+    assert d2.synced is False and d2.line_count == 2
+
+
+def test_lyric_library_add_remove_and_persist(tmp_path):
+    from core.lyrics_library import LyricLibrary
+
+    lib = LyricLibrary(tmp_path / "lyrics")
+    assert lib.size == 0
+    lib.add_text("甲行\n乙行", title="测试曲", artist="某人")
+    assert lib.size == 1
+    # 重新打开应能读回（落盘 JSON）
+    lib2 = LyricLibrary(tmp_path / "lyrics")
+    assert lib2.size == 1
+    assert lib2.get("测试曲").line_count == 2
+    assert lib2.remove("测试曲") is True
+    assert LyricLibrary(tmp_path / "lyrics").size == 0
+
+
+def test_lyric_file_title_artist_inference(tmp_path):
+    from core.lyrics_library import load_lyric_file
+
+    p = tmp_path / "周杰伦 - 七里香.lrc"
+    p.write_text("[00:01.00]窗外的麻雀\n", encoding="utf-8")
+    doc = load_lyric_file(p)
+    assert doc.title == "七里香" and doc.artist == "周杰伦"
+
+
+def test_lyric_match_corrects_asr_errors():
+    """核心：识别文本与歌词有局部差异时，应被歌词纠正。"""
+    from core.lyrics_library import apply_report, match_document, parse_lyric_text
+
+    doc = parse_lyric_text(
+        "要多努力才走得到远方\n如果梦想不曾坠落悬崖千钧一发",
+        title="最初的梦想")
+    subs = [_line("要多努力才走得到远方", 0.0, 3.0),
+            _line("如果梦想不曾坠落悬崖千军一发", 3.0, 7.0)]
+    rep = match_document(subs, doc, threshold=0.5)
+    assert rep.score > 0.7
+    out, n = apply_report(subs, rep, min_score=0.7)
+    assert n == 1
+    assert out[1].text == "如果梦想不曾坠落悬崖千钧一发"
+
+
+def test_lyric_match_rejects_unrelated_document():
+    from core.lyrics_library import match_document, parse_lyric_text
+
+    doc = parse_lyric_text("完全不同的另一首歌的歌词内容在这里",
+                           title="无关歌曲")
+    subs = [_line("今天我们要聊一个技术话题", 0.0, 3.0)]
+    rep = match_document(subs, doc, threshold=0.55)
+    assert rep.matches == [] and rep.score == 0.0
+
+
+def test_lyric_boundary_hints_align_to_lines():
+    """歌词分句应映射为断句线索，让字幕在歌词行末断开。"""
+    from core.lyrics_library import lyric_boundary_hints, parse_lyric_text
+    from core.models import SubtitleWord
+
+    doc = parse_lyric_text("要多努力才走得到远方\n如果梦想不曾坠落",
+                           title="x")
+    text = "要多努力才走得到远方如果梦想不曾坠落"
+    words = [SubtitleWord(text=ch, start=i * 0.25, end=(i + 1) * 0.25)
+             for i, ch in enumerate(text)]
+    hints = lyric_boundary_hints(words, doc)
+    assert hints is not None
+    # 断点应落在第 1 行歌词末尾（「方」= 索引 9）之后
+    assert hints[9] is True
+    assert sum(1 for h in hints if h) == 1
+
+
+# ---------------- 弹幕旁路校正 ----------------
+
+def test_danmaku_correction_fixes_proper_noun():
+    """核心：弹幕反复出现的正确写法应纠正同音误识别。"""
+    from core.danmaku_correct import correct_with_log
+    from core.livexml import Danmaku, LiveLog
+
+    log = LiveLog()
+    for k in range(5):
+        log.danmaku.append(Danmaku(time=10.0 + k * 0.5,
+                                   text="主播叫脆脆鲨呀", user_id="u1"))
+    subs = [_line("主播叫翠翠沙呀", 10.2, 13.0)]
+    out, rep = correct_with_log(subs, log)
+    assert rep.applied == 1
+    assert out[0].text == "主播叫脆脆鲨呀"
+
+
+def test_danmaku_correction_ignores_far_chatter():
+    """时间上远离的弹幕不应影响字幕。"""
+    from core.danmaku_correct import correct_with_log
+    from core.livexml import Danmaku, LiveLog
+
+    log = LiveLog()
+    for k in range(5):
+        log.danmaku.append(Danmaku(time=900.0 + k, text="主播叫脆脆鲨呀"))
+    subs = [_line("主播叫翠翠沙呀", 10.0, 13.0)]
+    out, rep = correct_with_log(subs, log, window=5.0)
+    assert rep.applied == 0
+    assert out[0].text == "主播叫翠翠沙呀"
+
+
+def test_danmaku_correction_never_changes_timeline():
+    from core.danmaku_correct import correct_with_log
+    from core.livexml import Danmaku, LiveLog
+
+    log = LiveLog()
+    for k in range(4):
+        log.danmaku.append(Danmaku(time=10.0, text="主播叫脆脆鲨呀"))
+    subs = [_line("主播叫翠翠沙呀", 10.0, 13.0)]
+    out, _ = correct_with_log(subs, log)
+    assert out[0].start == pytest.approx(10.0)
+    assert out[0].end == pytest.approx(13.0)
+
+
+def test_danmaku_correction_without_log_is_safe():
+    from core.danmaku_correct import correct_with_log
+
+    subs = [_line("任意文本内容", 0.0, 2.0)]
+    out, rep = correct_with_log(subs, None)
+    assert rep.applied == 0 and out[0].text == "任意文本内容"
+
+
+# ---------------- 配置项存在性 ----------------
+
+def test_new_song_and_segment_config_fields():
+    from core.config import SegmentConfig, SongConfig
+
+    sc = SongConfig()
+    for name in ("manual_titles", "restrict_bgm_to_manual", "lyric_correct",
+                 "lyric_library_dir", "segment_by_lyrics",
+                 "lyric_doc_threshold", "lyric_line_threshold",
+                 "danmaku_correct", "danmaku_time_window"):
+        assert hasattr(sc, name), f"SongConfig 缺少 {name}"
+    sg = SegmentConfig()
+    assert hasattr(sg, "inner_space")
+
+
+def test_flv_and_mkv_require_transcode():
+    """回归：浏览器不支持的容器必须走转码，而不是直接流式返回。"""
+    import desktop_server as ds
+
+    for ext in (".flv", ".mkv", ".ts", ".rmvb", ".avi"):
+        assert ext in ds.TRANSCODE_CONTAINERS, f"{ext} 应走转码"
+    # MP4/WebM 可直接播放，不应转码
+    for ext in (".mp4", ".webm"):
+        assert ext not in ds.TRANSCODE_CONTAINERS
+
+
 # ---------------- 弹幕 XML ----------------
 
 XML = """<?xml version="1.0" encoding="UTF-8"?>

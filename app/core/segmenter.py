@@ -44,9 +44,14 @@ class SegmentTuning:
     w_pause: float = 0.8          # 长停顿（≥ pause_gap 秒）
     w_dev: float = 1.0            # 行长偏离目标
     w_duration: float = 0.5       # 时长偏离目标（3s）
+    w_lyric: float = 2.6          # 歌词/弹幕给出的断句位置（强提示）
     pause_gap: float = 0.28       # 视为停顿的相邻单元间隔（秒）
     # 行首/行尾孤立标点清理
     strip_punct: bool = True
+    # 同一句内被迫分隔时，用空格代替（不引入逗号等标点）
+    inner_space: bool = True
+    # 触发「句内空格」的最小行长：小于此长度不断开，避免把短语拆碎
+    inner_space_min_chars: int = 14
 
 
 def _is_punct(ch: str) -> bool:
@@ -158,6 +163,7 @@ def segment_words(
     start: float | None = None,
     end: float | None = None,
     punctuation: list[bool] | None = None,
+    lyric_bounds: list[bool] | None = None,
 ) -> list[SubtitleLine]:
     """词流 → 字幕行（DP 全局最优切分）。
 
@@ -166,6 +172,9 @@ def segment_words(
     punctuation：与「原子」等长的断句线索（长度或标点标记），若给出则
     与词内标点共同决定断行奖励——模型输出常无标点，需要外部补标点后
     再映射回来。传入时长度应为 split_atoms(words) 的长度。
+    lyric_bounds：同样按原子对齐的**歌词/弹幕边界**。与 punctuation 的区别：
+    歌词边界是「这句话本该在这里断」的强先验（人工歌词的分句），
+    权重高于普通标点线索；两者可同时提供。
     返回的 SubtitleLine 只含切好的词，low_confidence 等字段由调用方补充。
     """
     tuning = tuning or SegmentTuning()
@@ -180,6 +189,9 @@ def segment_words(
     if hints is not None and len(hints) != len(atoms):
         # 长度不匹配（区间裁剪/多字词拆分）时放弃外部线索，避免错位
         hints = None
+    lb = lyric_bounds
+    if lb is not None and len(lb) != len(atoms):
+        lb = None
 
     n = len(atoms)
     prefix_chars = [0] * (n + 1)
@@ -191,6 +203,8 @@ def segment_words(
     back = [0] * (n + 1)
     best[0] = 0.0
     tgt = max(1.0, tuning.target_chars)
+    # 允许的超长容差：超过 target 一定倍数才考虑「句内空格」
+    space_threshold = max(tuning.inner_space_min_chars, tgt * 1.6)
 
     for i in range(n):
         if best[i] == INF:
@@ -202,9 +216,14 @@ def segment_words(
                 break
             cost = tuning.w_dev * ((chars - tgt) / tgt) ** 2
             cost += tuning.w_duration * max(0.0, (dur - 3.0) / 3.0) ** 2
+            # 句内空格：一行被迫很长时轻微惩罚，促使 DP 更愿意断开
+            if tuning.inner_space and chars > space_threshold:
+                cost += tuning.w_dev * ((chars - tgt) / tgt) ** 2 * 0.5
             if j < n:
-                # 标点/停顿奖励（负代价）；外部标点线索优先
-                if hints is not None and hints[j - 1]:
+                # 断行奖励（负代价）；歌词边界 > 外部标点 > 词内标点/停顿
+                if lb is not None and lb[j - 1]:
+                    cost -= tuning.w_lyric
+                elif hints is not None and hints[j - 1]:
                     cost -= tuning.w_clause
                 else:
                     cost -= _boundary_bonus(atoms[j - 1], atoms[j], tuning)
@@ -228,8 +247,38 @@ def segment_words(
             text_atoms = _drop_leading_punct(text_atoms)
         if not text_atoms:
             continue
+        if tuning.inner_space and len(text_atoms) > 1:
+            text_atoms = _insert_inner_space(text_atoms, tuning)
         lines.append(SubtitleLine(words=text_atoms))
     return lines
+
+
+def _insert_inner_space(atoms: list[SubtitleWord],
+                        tuning: SegmentTuning) -> list[SubtitleWord]:
+    """在一行内部插入空格分隔（用户要求：同一句内需要分隔时用空格）。
+
+    只在「行长明显超过目标且该处有自然停顿」时插一个空格——把所有位置
+    都插空格会把中文切成碎片。
+    """
+    text = _join_text(atoms)
+    if len(text) < tuning.inner_space_min_chars:
+        return atoms
+    # 找最长的词间停顿位置
+    best_pos, best_gap = -1, tuning.pause_gap
+    for k in range(1, len(atoms)):
+        gap = atoms[k].start - atoms[k - 1].end
+        if gap > best_gap:
+            best_pos, best_gap = k, gap
+    if best_pos <= 0:
+        return atoms
+    out = list(atoms)
+    # 在断点后的原子前加前导空格（_join_text 会保留原子自带的空格）
+    nxt = out[best_pos]
+    if not nxt.text.startswith(" "):
+        from .models import SubtitleWord as _W
+
+        out[best_pos] = _W(text=" " + nxt.text, start=nxt.start, end=nxt.end)
+    return out
 
 
 def _drop_leading_punct(atoms: list[SubtitleWord]) -> list[SubtitleWord]:

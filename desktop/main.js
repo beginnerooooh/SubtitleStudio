@@ -281,6 +281,10 @@ ipcMain.handle('dialog:openAny', async (_e, kind) => {
     danmaku: [{ name: '弹幕', extensions: ['xml', 'jsonl'] }],
     subtitle: [{ name: '字幕', extensions: ['srt', 'ass', 'vtt', 'lrc', 'json'] }],
     audio: [{ name: '音频', extensions: ['wav', 'mp3', 'flac', 'm4a'] }],
+    lyrics: [{ name: '歌词', extensions: ['lrc', 'txt', 'srt', 'json'] }],
+    media: [{ name: '音视频',
+              extensions: ['mp4', 'mkv', 'flv', 'mov', 'webm', 'ts', 'avi',
+                           'wmv', 'rmvb', 'mp3', 'wav', 'm4a', 'flac'] }],
   };
   const r = await dialog.showOpenDialog(mainWindow, {
     title: '选择文件',

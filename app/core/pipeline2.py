@@ -71,6 +71,8 @@ class PipelineResult:
     bgm_flags: list = field(default_factory=list)
     # 弹幕旁路信息摘要（主播名/点歌请求/热词），便于 UI 展示与复核
     live_summary: dict = field(default_factory=dict)
+    # 文本校正明细（弹幕专名校正 + 歌词库替换），供 UI 展示与回溯
+    corrections: dict = field(default_factory=dict)
 
 
 class Pipeline:
@@ -114,6 +116,10 @@ class Pipeline:
                 lines, songs = self._recognize(vocals, duration, context)
                 mode = "blind"
             self._finalize(lines)
+            # 文本级校正：先弹幕旁路（专名），再歌词库（整句）。
+            # 顺序有意为之——弹幕能纠正昵称/术语这类专名，歌词库处理整句
+            # 文本；反过来做会让歌词替换后的文本再被弹幕改动，难以复现。
+            lines, corrections = self._post_correct(lines, context)
             files = self._export(out_dir, lines, context)
             report = self._evaluate(lines, duration)
             self.timings["total"] = round(time.time() - t_all, 2)
@@ -125,6 +131,7 @@ class Pipeline:
                 evaluation=report, timings=dict(self.timings),
                 bgm_flags=_flags_payload(context.bgm_decisions),
                 live_summary=_live_summary(context.live),
+                corrections=corrections,
             )
         except TaskCancelled:
             raise
@@ -412,14 +419,30 @@ class Pipeline:
         return results
 
     def _song_requests(self, ctx: "Context") -> list[tuple[float, str, str]]:
-        """弹幕/SC 里的点歌请求 [(时间, 用户, 歌名)]；无弹幕返回空。"""
+        """歌曲线索 [(时间, 用户, 歌名)]。
+
+        优先级：**用户手动录入的清单 > 弹幕点歌请求**。
+
+        为什么清单放最前：用户明确知道本场唱了什么，比从弹幕猜可靠得多；
+        把清单作为「时间未知的请求」注入后，后续 `_nearest_request` 仍能
+        按演唱块就近匹配，而且在弹幕缺失（没导 XML）时也能工作。
+        """
+        manual = [str(t).strip() for t in
+                  (getattr(self.cfg.song, "manual_titles", ()) or ())
+                  if str(t).strip()]
+        # 时间给 -1 表示「不确定时间」，_nearest_request 会把它当兜底候选
+        from_manual = [(-1.0, self.MANUAL_SOURCE, name) for name in manual]
+
         live = getattr(ctx, "live", None)
         if live is None:
-            return []
+            return from_manual
         try:
-            return live.song_requests()
+            return from_manual + list(live.song_requests())
         except Exception:
-            return []
+            return from_manual
+
+    # 标记手动录入来源，便于日志区分
+    MANUAL_SOURCE = "@manual"
 
     def _nearest_request(self, requests, start: float, end: float) -> str:
         """取本演唱块附近（前 5 分钟 ~ 后 1 分钟）最近的一条点歌请求。
@@ -754,8 +777,50 @@ class Pipeline:
             w_pause=self.cfg.segment.w_pause,
             w_dev=self.cfg.segment.w_dev,
             w_duration=self.cfg.segment.w_duration,
-            pause_gap=self.cfg.segment.pause_gap)
-        return segment_words(words, tuning, punctuation=hints)
+            pause_gap=self.cfg.segment.pause_gap,
+            inner_space=getattr(self.cfg.segment, "inner_space", True))
+        # 歌词/弹幕给出的断句先验（强于普通标点）。
+        # 这一阶段还不知道「这段属于哪首歌」，因此用两种来源：
+        #   1) 用户手动录入的曲目（最可靠）
+        #   2) 与词流时间重叠的弹幕文本
+        lb = self._lyric_hints(words, ctx)
+        return segment_words(words, tuning, punctuation=hints,
+                             lyric_bounds=lb)
+
+    def _lyric_hints(self, words: list[SubtitleWord],
+                     ctx: "Context") -> Optional[list[bool]]:
+        """歌词/弹幕断句线索（失败时安静退化为 None）。"""
+        if not getattr(self.cfg.song, "segment_by_lyrics", True):
+            return None
+        try:
+            from .lyrics_library import (LyricLibrary, danmaku_boundary_hints,
+                                         lyric_boundary_hints)
+        except Exception:
+            return None
+
+        # 优先：手动录入的曲目在曲库里有歌词
+        titles = list(getattr(self.cfg.song, "manual_titles", ()) or ())
+        if titles:
+            try:
+                lib = LyricLibrary(self.cfg.song.lyric_library_dir)
+                for t in titles:
+                    doc = lib.find_by_title(str(t))
+                    if doc is None:
+                        continue
+                    h = lyric_boundary_hints(words, doc)
+                    if h:
+                        self._log(f"断句参考歌词《{doc.title}》")
+                        return h
+            except Exception:
+                pass
+        # 退化：用同期弹幕中反复出现的短句
+        live = getattr(ctx, "live", None)
+        if live is not None:
+            try:
+                return danmaku_boundary_hints(words, live)
+            except Exception:
+                return None
+        return None
 
     def _punctuation_hints(self, words: list[SubtitleWord]) -> Optional[list[bool]]:
         """用标点模型给切行提供句读线索（不写进最终字幕）。
@@ -846,6 +911,75 @@ class Pipeline:
         kept = [ln for ln in lines
                 if not any(ln.start < e and a < ln.end for a, e in spans)]
         return sorted(kept + song_lines, key=lambda x: x.start)
+
+    def _post_correct(self, lines: list[SubtitleLine],
+                      ctx: "Context") -> tuple[list[SubtitleLine], dict]:
+        """生成后文本校正：歌词库 + 弹幕旁路。
+
+        两步都是「可选且可关闭」的：任一失败只记录警告，绝不中断主流程
+        （用户已经等了几分钟，不该因为校正模块的问题丢掉识别结果）。
+        """
+        from .danmaku_correct import correct_with_log
+        from .lyrics_library import (LyricLibrary, apply_report, best_document)
+
+        out = lines
+        detail: dict = {}
+
+        # ---- 1) 弹幕/礼物/SC 专名校正 ----
+        vp = self.cfg.voiceprint
+        sc = self.cfg.song
+        if getattr(sc, "danmaku_correct", False):
+            if ctx.live is None:
+                detail["danmaku"] = {"applied": 0,
+                                     "reason": "未提供弹幕 XML"}
+            else:
+                try:
+                    self._progress("correct", 0.0, "用弹幕校正专名…")
+                    out, rep = correct_with_log(
+                        out, ctx.live,
+                        window=float(getattr(sc, "danmaku_time_window", 12.0)))
+                    detail["danmaku"] = rep.to_dict()
+                    self._log(f"弹幕校正：{rep.reason}")
+                except Exception as exc:  # noqa: BLE001
+                    self.warnings.append(f"弹幕校正失败：{exc}")
+                    detail["danmaku"] = {"applied": 0, "reason": str(exc)}
+            _ = vp
+
+        # ---- 2) 歌词库整句替换 ----
+        if getattr(sc, "lyric_correct", False):
+            try:
+                lib = LyricLibrary(sc.lyric_library_dir)
+                if lib.size == 0:
+                    detail["lyrics"] = {"applied": 0,
+                                        "reason": "歌词库为空"}
+                else:
+                    self._progress("correct", 0.5, "用歌词库校正文本…")
+                    titles = list(getattr(sc, "manual_titles", ()) or ())
+                    rep = best_document(
+                        out, lib, titles=titles or None,
+                        threshold=float(getattr(sc, "lyric_doc_threshold", 0.55)),
+                        on_log=self._log)
+                    if rep is None or not rep.matches:
+                        detail["lyrics"] = {
+                            "applied": 0,
+                            "reason": (rep.reason if rep else "曲库中无匹配歌曲")}
+                    else:
+                        out, n = apply_report(
+                            out, rep,
+                            min_score=float(getattr(sc, "lyric_line_threshold", 0.75)))
+                        info = rep.to_dict()
+                        info["applied"] = n
+                        detail["lyrics"] = info
+                        self._log(
+                            f"歌词校正：《{info['title']}》 相似度 "
+                            f"{info['score']:.2f}，替换 {n} 行")
+            except Exception as exc:  # noqa: BLE001
+                self.warnings.append(f"歌词校正失败：{exc}")
+                detail["lyrics"] = {"applied": 0, "reason": str(exc)}
+
+        if detail:
+            self._progress("correct", 1.0, "文本校正完成")
+        return out, detail
 
     def _finalize(self, lines: list[SubtitleLine]) -> None:
         """收尾：去重、去空行、排序、修正非法时间。

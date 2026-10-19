@@ -271,8 +271,14 @@ body {
   text-overflow: clip; white-space: nowrap;
 }
 .clip:hover { filter: brightness(1.15); }
-.clip.selected { background: var(--clip-sel); color: #17181a; font-weight: 600;
-                 border-color: #fff; z-index: 5; }
+/* 选中态：保持主色（蓝）不变，只用高亮描边 + 阴影区分，
+ * 避免整块变橙导致「哪段是字幕内容」的视觉判断被打断。 */
+.clip.selected {
+  background: var(--clip); color: #eef1f5;
+  border-color: #fff;
+  box-shadow: 0 0 0 1px #fff, 0 0 7px rgba(255, 255, 255, .55);
+  z-index: 5;
+}
 .clip.flagged { background: var(--warn); color: #17181a; }
 /* 左右拖拽手柄：用不同颜色区分（左=起点/绿，右=终点/橙），悬停更明显 */
 .clip .edge {

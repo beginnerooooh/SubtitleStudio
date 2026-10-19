@@ -76,7 +76,10 @@ JOBS_LOCK = threading.Lock()
 # 允许前端访问的媒体扩展名（防目录穿越只做路径存在性校验）
 MEDIA_EXTS = {".mp4", ".mkv", ".mov", ".flv", ".webm", ".mp3", ".wav",
               ".flac", ".m4a", ".aac", ".ogg", ".srt", ".ass", ".vtt",
-              ".json", ".xml", ".lrc"}
+              ".json", ".xml", ".lrc", ".ts", ".rmvb", ".avi", ".wmv"}
+# Chromium 的 <video> 无法直接播放这些容器，需要后端用 ffmpeg 转码。
+# （MP4/WebM/Ogg 及其音频对应格式可直接播放）
+TRANSCODE_CONTAINERS = {".flv", ".mkv", ".ts", ".rmvb", ".avi", ".wmv"}
 
 
 # ---------------- 序列化辅助 ----------------
@@ -388,6 +391,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"ok": True,
                                     "providers": songmod.available_lyric_providers(),
                                     "order": list(songmod.DEFAULT_PROVIDER_ORDER)})
+        if path == "/api/lyrics/library":
+            return self._library_list()
+        if path == "/api/lyrics/match":
+            return self._lyrics_match(query)
         if path == "/api/profiles":
             from core.streamer import list_profiles
 
@@ -494,6 +501,13 @@ class Handler(BaseHTTPRequestHandler):
                 dry_run=bool(body.get("dry_run", True)))
             return self._send_json({"ok": True,
                                     "drafts": [m.__dict__ for m in stale]})
+        if path == "/api/lyrics/library/add":
+            return self._library_add(body)
+        if path == "/api/lyrics/library/fetch":
+            return self._library_fetch(body)
+        if path == "/api/lyrics/library/remove":
+            return self._library_remove(body)
+
         if path == "/api/profiles/delete":
             from core.streamer import delete_profile
 
@@ -755,6 +769,104 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    # ---------- 歌词库写操作 ----------
+
+    def _library_add(self, body: dict) -> None:
+        """导入歌词：可给文件路径、或直接给文本。"""
+        lib = self._library()
+        path = (body.get("path") or "").strip()
+        text = body.get("text") or ""
+        title = (body.get("title") or "").strip()
+        artist = (body.get("artist") or "").strip()
+        try:
+            if path:
+                p = Path(path)
+                if not p.is_absolute():
+                    p = (ROOT / p).resolve()
+                if not p.is_file():
+                    return self._send_json(
+                        {"ok": False, "error": f"文件不存在：{p}"}, 400)
+                doc = lib.add_file(p)
+            elif text.strip():
+                if not title:
+                    return self._send_json(
+                        {"ok": False, "error": "粘贴歌词时需要提供歌名"}, 400)
+                doc = lib.add_text(text, title=title, artist=artist)
+            else:
+                return self._send_json(
+                    {"ok": False, "error": "需要 path 或 text"}, 400)
+        except Exception as exc:  # noqa: BLE001
+            return self._send_json({"ok": False, "error": str(exc)}, 400)
+        return self._send_json({"ok": True, "title": doc.title,
+                                "artist": doc.artist,
+                                "line_count": doc.line_count,
+                                "size": lib.size})
+
+    def _library_fetch(self, body: dict) -> None:
+        """按歌名（+可选歌手）在线拉取歌词并入库。"""
+        lib = self._library()
+        title = (body.get("title") or "").strip()
+        artist = (body.get("artist") or "").strip()
+        if not title:
+            return self._send_json({"ok": False, "error": "需要 title"}, 400)
+        logs: list[str] = []
+        try:
+            added = lib.fetch(title, artist, on_log=logs.append)
+        except Exception as exc:  # noqa: BLE001
+            return self._send_json({"ok": False, "error": str(exc),
+                                    "log": logs}, 500)
+        return self._send_json({
+            "ok": True, "added": [{"title": d.title, "artist": d.artist,
+                                   "line_count": d.line_count,
+                                   "synced": d.synced} for d in added],
+            "size": lib.size, "log": logs,
+            "error": "" if added else "没有找到可用歌词",
+        })
+
+    def _library_remove(self, body: dict) -> None:
+        lib = self._library()
+        title = (body.get("title") or "").strip()
+        artist = (body.get("artist") or "").strip()
+        if not title:
+            return self._send_json({"ok": False, "error": "需要 title"}, 400)
+        ok = lib.remove(title, artist)
+        return self._send_json({"ok": ok, "size": lib.size})
+
+    # ---------- 歌词库 ----------
+
+    def _library(self):
+        from core.lyrics_library import LyricLibrary
+
+        return LyricLibrary(ROOT / "lyrics")
+
+    def _library_list(self) -> None:
+        lib = self._library()
+        return self._send_json({
+            "ok": True, "size": lib.size,
+            "docs": [{"title": d.title, "artist": d.artist,
+                      "line_count": d.line_count, "synced": d.synced,
+                      "source": d.source, "path": d.path}
+                     for d in lib.list_docs()],
+        })
+
+    def _lyrics_match(self, query: dict) -> None:
+        """预览「字幕与某首歌词」的匹配结果（不改动项目数据）。"""
+        from core.lyrics_library import match_document
+
+        pid = (query.get("project") or [""])[0]
+        title = (query.get("title") or [""])[0]
+        artist = (query.get("artist") or [""])[0]
+        lib = self._library()
+        doc = lib.get(title, artist) or lib.find_by_title(title) if title else None
+        if doc is None:
+            return self._send_json({"ok": False, "error": "歌词库中找不到该曲目"}, 404)
+        if not pid:
+            return self._send_json({"ok": False, "error": "需要 project 参数"}, 400)
+        state = STORE.load(pid)
+        lines = payload_to_lines(state.lines)
+        rep = match_document(lines, doc)
+        return self._send_json({"ok": True, **rep.to_dict()})
+
     # ---------- 视频信息（帧率，供时间码「时:分:秒:帧」使用） ----------
 
     def _video_info(self, target: str) -> None:
@@ -781,6 +893,13 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- 媒体流（支持 Range，供 <video> 拖动） ----------
 
     def _serve_media(self, target: str) -> None:
+        """媒体流。
+
+        Chromium 只能播放它自带的容器集合（MP4/WebM/Ogg…），**FLV、MKV、
+        RMVB、TS 等一律不能直接播放**——表现为 `<video>` 黑屏或 error。
+        因此这里对不支持的容器走「ffmpeg 实时转码为 fMP4」的代理路径：
+        仍然以流的方式输出，`<video>` 可以边下边播、可 seek（靠 Range 分片）。
+        """
         if not target:
             return self._send_error_json("缺少 path 参数", 400)
         p = Path(unquote(target))
@@ -790,6 +909,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_error_json(f"文件不存在：{p}", 404)
         if p.suffix.lower() not in MEDIA_EXTS:
             return self._send_error_json(f"不支持的类型：{p.suffix}", 403)
+        if p.suffix.lower() in TRANSCODE_CONTAINERS:
+            return self._serve_transcoded(p)
+        return self._send_file(p)
+
+    def _send_file(self, p: Path) -> None:
+        """按 Range 发送文件（供 <video> 播放与拖动）。"""
         size = p.stat().st_size
         ctype = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
         start, end = 0, size - 1
@@ -819,6 +944,119 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
                 remaining -= len(chunk)
+
+    # ---------- 容器转码代理（FLV / MKV / TS 等） ----------
+
+    def _serve_transcoded(self, src: Path) -> None:
+        """把 Chromium 不支持的容器转成可播放的 MP4，再走普通 Range 流。
+
+        为什么不在线流式转码（踩坑记录）
+        ────────────────────────────
+        流式输出 fMP4（`frag_keyframe+empty_moov`）虽然能边转边播，但
+        **fMP4 分片没有总时长**——浏览器只能报告「已缓冲的时长」，
+        `<video>.duration` 会是 2.52s / 10.45s 这样的错误值（实测），
+        导致进度条与字幕时间轴完全错位，对字幕工具是致命的。
+
+        因此改为「先转成带 faststart 的完整 MP4 并缓存」：
+        - remux（`-c copy`）通常只需 0.1 秒/20 秒素材，几乎无感；
+        - 输出文件有正确 moov + 总时长，走普通 Range 流，可自由 seek；
+        - 缓存按「路径 + 修改时间 + 大小」命名，二次打开秒开。
+        """
+        from core.env import detect_env
+
+        env = detect_env()
+        ffmpeg = env.ffmpeg_path or "ffmpeg"
+        if not env.ffmpeg_available:
+            return self._send_error_json(
+                f"该格式（{src.suffix}）浏览器无法直接播放，且未找到 FFmpeg"
+                " 用于转码。请安装 FFmpeg 后重试。", 503)
+
+        cache = CACHE_DIR / "transcode"
+        cache.mkdir(parents=True, exist_ok=True)
+        try:
+            st = src.stat()
+            key = f"{abs(hash((str(src), st.st_mtime, st.st_size)))}.mp4"
+        except OSError:
+            return self._send_error_json("无法读取源文件", 500)
+        out = cache / key
+
+        if not out.is_file() or out.stat().st_size == 0:
+            attempts = [
+                # 先 remux：不重编码，秒级完成，画质无损
+                ["-c", "copy"],
+                # 编码不兼容时退回转码
+                ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                 "-c:a", "aac", "-b:a", "128k"],
+            ]
+            # 注意：临时文件必须保留 .mp4 扩展名——ffmpeg 靠扩展名推断
+            # 封装格式，用 `.part` 会报 "Unable to choose an output format"
+            # （实测踩过）。因此用 `name.tmp.mp4` 的形式。
+            tmp = out.with_suffix(".tmp.mp4")
+            ok = False
+            for args in attempts:
+                cmd = [ffmpeg, "-y", "-v", "error", "-fflags", "+genpts",
+                       "-i", str(src), *args, "-movflags", "+faststart",
+                       str(tmp)]
+                try:
+                    import subprocess
+
+                    proc = subprocess.run(cmd, capture_output=True, timeout=1800)
+                except Exception:
+                    continue
+                if proc.returncode == 0 and tmp.is_file() and tmp.stat().st_size > 0:
+                    tmp.replace(out)
+                    ok = True
+                    break
+                tmp.unlink(missing_ok=True)
+                if proc.stderr:
+                    self.log_error(
+                        f"transcode {src.name}: "
+                        f"{proc.stderr.decode('utf-8', 'replace')[:300]}")
+            if not ok:
+                return self._send_error_json("转码失败：无法解码该文件", 500)
+
+        # 交给通用的文件流逻辑（支持 Range / seek）
+        return self._send_file(out)
+
+    def _stream_ffmpeg(self, cmd: list[str], src: Path) -> bool:
+        """执行 ffmpeg 并把输出边读边写。首个字节到达后才发响应头，
+        这样失败时可以干净地返回 JSON 错误（已发头就无法改状态码）。"""
+        import subprocess
+
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, bufsize=0)
+        except Exception:
+            return False
+        try:
+            first = proc.stdout.read(1) if proc.stdout else b""
+            if not first:
+                proc.wait(timeout=20)
+                return False
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Accept-Ranges", "none")
+            self.end_headers()
+            self.wfile.write(first)
+            while True:
+                chunk = proc.stdout.read(1 << 16)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+            return True
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # 客户端 seek 或关闭播放器时主动断开，属于正常情况
+            return True
+        except Exception:
+            return False
+        finally:
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+            except Exception:
+                pass
 
 
 def serve(host: str = "127.0.0.1", port: int = 8756,
