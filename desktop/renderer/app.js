@@ -61,15 +61,173 @@ const API_BASE = () => `http://127.0.0.1:${S.port}`;
 const api = (path, opts) => fetch(API_BASE() + path, opts);
 const mediaUrl = (p) => `${API_BASE()}/api/media?path=${encodeURIComponent(p)}`;
 
-async function apiJson(path, method = 'GET', body) {
-  const res = await api(path, {
-    method,
-    headers: { 'Content-Type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  const data = await res.json().catch(() => ({ ok: false, error: '响应解析失败' }));
-  if (!data.ok && data.error) throw new Error(data.error);
-  return data;
+/**
+ * 把 API 路径翻译成用户能看懂的操作名（用于阻塞层文案）。
+ *
+ * 放在 apiJson 层统一处理的原因：调用点有 30 多处，逐个包装既啰嗦
+ * 又容易漏；而「哪些请求会让用户等」本质上由接口决定。写操作的
+ * 默认耗时明显高于读操作，只有它们才值得弹窗。
+ */
+function apiLabel(path) {
+  const p = path.split('?')[0];
+  const table = [
+    [/^\/api\/generate/, '正在识别字幕'],
+    [/^\/api\/evaluate/, '正在评测'],
+    [/^\/api\/lyrics\/library\/fetch/, '正在拉取歌词'],
+    [/^\/api\/lyrics\/library\/add/, '正在导入歌词'],
+    [/^\/api\/lyrics\/library\/remove/, '正在删除歌词'],
+    [/^\/api\/lyrics\/search/, '正在检索歌词'],
+    [/^\/api\/lyrics\/match/, '正在比对歌词'],
+    [/^\/api\/profiles\/delete/, '正在删除声纹'],
+    [/^\/api\/profiles/, '正在提取声纹'],
+    [/^\/api\/cache\/clean/, '正在清理缓存'],
+    [/^\/api\/drafts\/clean/, '正在清理草稿'],
+    [/^\/api\/danmaku/, '正在解析弹幕'],
+    [/^\/api\/projects\/[^/]+\/export/, '正在导出字幕'],
+    [/^\/api\/projects\/[^/]+\/undo/, '正在撤销'],
+    [/^\/api\/projects\/[^/]+\/redo/, '正在重做'],
+    [/^\/api\/projects\/[^/]+\/save/, '正在保存'],
+    [/^\/api\/projects\/[^/]+\/autosave/, ''],      // 自动保存不打扰用户
+    [/^\/api\/projects\/[^/]+\/recover/, '正在恢复草稿'],
+    [/^\/api\/projects\/[^/]+\/history/, ''],
+    [/^\/api\/projects\/[^/]+\/rename/, '正在重命名'],
+    [/^\/api\/projects\/[^/]+\/export/, '正在导出'],
+    [/^\/api\/projects$/, ''],
+    [/^\/api\/projects\/[^/]+$/, '正在打开项目'],
+    [/^\/api\/edit\//, '正在应用修改'],
+    [/^\/api\/thumbs/, '正在生成缩略图'],
+    [/^\/api\/videoinfo/, ''],
+    [/^\/api\/media/, ''],
+    [/^\/api\/health/, ''],
+  ];
+  for (const [re, label] of table) {
+    if (re.test(p)) return label;
+  }
+  return '';
+}
+
+// 这些读接口不值得弹窗（很快，且频繁）
+const SILENT_GET = /^\/api\/(health|videoinfo|projects(\/[^/]+(\/history)?)?|profiles|lyrics\/(providers|library)|cache\/stats|media)/;
+
+/**
+ * 发请求。写操作（或耗时 GET）自动套上阻塞层，防止等待期间重复点击。
+ * `__silent` 选项可让调用方显式跳过弹窗（例如自动保存）。
+ */
+async function apiJson(path, method = 'GET', body, opts = {}) {
+  const p = path.split('?')[0];
+  const label = opts.label ?? apiLabel(path);
+  const silent = opts.silent === true
+    || (method === 'GET' && SILENT_GET.test(p))
+    || !label;
+  const run = async () => {
+    const res = await api(path, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const data = await res.json().catch(
+      () => ({ ok: false, error: '响应解析失败' }));
+    if (!data.ok && data.error) throw new Error(data.error);
+    return data;
+  };
+  if (silent) {
+    // 静默请求不弹窗，但仍走同一套解析与错误处理
+    try {
+      return await run();
+    } catch (err) {
+      err.__handled = true;
+      throw err;
+    }
+  }
+  return withBusy(label, run);
+}
+
+// ---------------- 全局阻塞进度层 ----------------
+//
+// 设计：所有「需要用户等待」的操作都被包一层 `withBusy()`。
+// 它做三件事：
+//   1. 显示居中进度窗口（遮罩吃掉所有点击 → 天然防重复点击）
+//   2. 显示操作名 / 进度 / 已用时间
+//   3. 同一时刻只允许一个任务：重复触发时直接忽略并提示
+//
+// 为什么要用遮罩而不是逐个 disable 按钮：入口太多（工具栏、右键菜单、
+// 快捷键、表格双击…），逐个 disable 一定会漏。
+
+const Busy = {
+  depth: 0,          // 允许嵌套（内层不重复显示）
+  timer: 0,
+  startedAt: 0,
+  label: '',
+  // 操作超过这个时长才显示弹窗，避免快速请求「闪一下」
+  delay: 120,
+};
+
+function busyShow(label, sub = '') {
+  Busy.label = label;
+  Busy.startedAt = Date.now();
+  $('busy-text').textContent = label;
+  $('busy-sub').textContent = sub;
+  $('busy-time').textContent = '';
+  $('busy-fill').style.width = '0%';
+  $('busy-fill').classList.add('indeterminate');
+  $('busy').classList.remove('hidden');
+  clearInterval(Busy.timer);
+  Busy.timer = setInterval(() => {
+    const s = ((Date.now() - Busy.startedAt) / 1000).toFixed(1);
+    $('busy-time').textContent = `已用 ${s}s`;
+  }, 200);
+}
+
+function busyHide() {
+  clearInterval(Busy.timer);
+  Busy.timer = 0;
+  $('busy').classList.add('hidden');
+  $('busy-fill').classList.remove('indeterminate');
+}
+
+/** 更新进度（ratio 为 null 时显示不确定态）。 */
+function busyProgress(ratio, sub) {
+  const fill = $('busy-fill');
+  if (sub != null) $('busy-sub').textContent = sub;
+  if (ratio == null || !Number.isFinite(ratio)) {
+    fill.classList.add('indeterminate');
+  } else {
+    fill.classList.remove('indeterminate');
+    fill.style.width = `${Math.max(0, Math.min(100, ratio * 100))}%`;
+  }
+}
+
+/**
+ * 包裹一次异步操作：显示阻塞层、防重入、出错时用弹窗提示。
+ *
+ * 重入时抛错而不是返回 undefined——静默返回会让调用方拿到假数据，
+ * 进而写入项目状态（很难排查）。
+ *
+ * @param {string} label   给用户看的操作名
+ * @param {Function} fn    实际工作（可以是 async）
+ */
+async function withBusy(label, fn) {
+  if (Busy.depth > 0) {
+    const e = new Error('上一操作尚未完成，请稍候');
+    e.__handled = true;
+    setSaveState('正在处理，请稍候', 'warn');
+    throw e;
+  }
+  Busy.depth += 1;
+  const showTimer = setTimeout(() => busyShow(label), Busy.delay);
+  try {
+    return await fn();
+  } catch (err) {
+    // 统一在这里报错，调用方不必到处写 alert
+    if (!err || !err.__handled) {
+      alert(`${label}失败：${err && err.message ? err.message : err}`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(showTimer);
+    Busy.depth -= 1;
+    if (Busy.depth === 0) busyHide();
+  }
 }
 
 // ---------------- 工具 ----------------
@@ -231,13 +389,18 @@ async function openVideo() {
 
 function setVideo(path) {
   const v = $('video');
-  // 关键：必须用绝对 URL。渲染层是 file:// 页面，相对路径 /api/media
-  // 会被解析成 file:///api/media 而无法加载（实测视频黑屏的根因）。
-  v.src = mediaUrl(path);
   const badge = path.split(/[\\/]/).pop();
   $('video-info').textContent = badge;
   $('video-info').title = path;
   $('preview-badge').textContent = badge;
+  // 先确保格式可播（必要时转码并显示进度），再设置 src
+  preparePlayable(path).then(() => {
+    // 关键：必须用绝对 URL。渲染层是 file:// 页面，相对路径 /api/media
+    // 会被解析成 file:///api/media 而无法加载（实测视频黑屏的根因）。
+    v.src = mediaUrl(path);
+  }).catch(() => {
+    v.src = mediaUrl(path);
+  });
   loadVideoInfo(path);
   v.onloadedmetadata = () => {
     $('status-dur').textContent = fmt(v.duration);
@@ -271,6 +434,64 @@ async function loadVideoInfo(path) {
   updateOverlay();
   if ($('status-dur').textContent) {
     $('status-dur').textContent = fmt($('video').duration || 0);
+  }
+}
+
+/**
+ * 处理「需要转码才能预览」的格式。
+ *
+ * Chromium 播不了 FLV/MKV/HEVC 等，后端要转码。长视频重编码可能十几分钟，
+ * 因此这里的策略是**前段就放行**：
+ *   1. 弹居中进度窗（同时挡住重复点击）
+ *   2. 轮询状态，一旦 `ready`（后端起出前段）立刻返回，让视频可播
+ *   3. 后台继续转完，用户下一次打开就是完整时长
+ *
+ * 不能等「全量转完」再放行——4GB/72 分钟 HEVC 要 ~20 分钟，
+ * 那样用户会以为程序卡死（实测超时 7 分钟仍未返回）。
+ */
+async function preparePlayable(path) {
+  let st;
+  try {
+    st = await apiJson('/api/transcode/status?path=' + encodeURIComponent(path),
+                       'GET', undefined, { silent: true });
+  } catch (e) {
+    return;                       // 查询失败就按原样尝试播放
+  }
+  if (!st.needed || st.ready) return;
+
+  const label = st.copyable ? '正在转换封装格式' : '正在转码视频（HEVC 需重编码）';
+  Busy.depth += 1;
+  busyShow(label, st.copyable ? '通常几秒完成' : '正在生成可预览片段…');
+  try {
+    // 触发后端开始转码（媒体请求本身会启动任务）
+    const probe = new Image();
+    probe.src = `/api/media?path=${encodeURIComponent(path)}&_t=${Date.now()}`;
+    // 轮询到「有可用片段」即放行（不是等转完）
+    const t0 = Date.now();
+    const LIMIT_MS = st.copyable ? 120000 : 180000;   // copy 2 分钟，转码 3 分钟
+    let lastP = 0;
+    while (Date.now() - t0 < LIMIT_MS) {
+      await new Promise((r) => setTimeout(r, 1200));
+      let s2;
+      try {
+        s2 = await apiJson('/api/transcode/status?path=' + encodeURIComponent(path),
+                           'GET', undefined, { silent: true });
+      } catch (e) { continue; }
+      if (s2.ready) {
+        busyProgress(1, '已可预览，后台继续转码');
+        await new Promise((r) => setTimeout(r, 350));
+        return;
+      }
+      if (Number.isFinite(s2.progress) && s2.progress > lastP) lastP = s2.progress;
+      busyProgress(lastP || null,
+        lastP ? `已转码 ${Math.round(lastP * 100)}%` : '正在生成可预览片段…');
+    }
+    // 超时也放行：至少让用户尝试播放，而不是一直转圈
+    busyProgress(null, '转码较慢，先尝试播放');
+    await new Promise((r) => setTimeout(r, 400));
+  } finally {
+    Busy.depth -= 1;
+    if (Busy.depth === 0) busyHide();
   }
 }
 
@@ -390,29 +611,51 @@ async function startGenerate() {
   $('btn-cancel').disabled = false;
   $('log').textContent = '';
   setDrawer(true);
-  pollJob();
+  // 生成是最长的操作：全程保持阻塞层，并实时反映进度。
+  // pollJob 的请求必须 silent，否则会与这层阻塞冲突（重入被拒）。
+  pollJobWhileBusy();
+}
+
+/** 轮询生成任务，同时把进度写进居中弹窗。 */
+async function pollJobWhileBusy() {
+  Busy.depth += 1;
+  busyShow('正在识别字幕', '准备中…');
+  try {
+    await pollJob();
+  } finally {
+    Busy.depth -= 1;
+    if (Busy.depth === 0) busyHide();
+  }
 }
 
 async function pollJob() {
   if (!S.job) return;
   let done = false;
   try {
-    const j = await apiJson(`/api/jobs/${S.job}`);
+    const j = await apiJson(`/api/jobs/${S.job}`, 'GET', undefined,
+                            { silent: true });
     $('progress-bar').style.width = `${Math.min(100, (j.ratio || 0) * 100)}%`;
     $('progress-text').textContent = j.message || '';
+    busyProgress(Number.isFinite(j.ratio) ? j.ratio : null, j.message || '');
     if (j.log && j.log.length) {
       const atBottom = $('log').scrollTop + $('log').clientHeight
         >= $('log').scrollHeight - 30;
       $('log').textContent = j.log.join('\n');
       if (atBottom) $('log').scrollTop = $('log').scrollHeight;
     }
-    if (j.status === 'done') { done = true; applyResult(j.result); }
-    else if (j.status === 'error') {
+    if (j.status === 'done') {
+      done = true;
+      busyProgress(1, '正在写入结果…');
+      await applyResult(j.result);
+    } else if (j.status === 'error') {
       done = true;
       $('progress-text').textContent = '失败：' + j.error;
+      busyProgress(null, '失败：' + j.error);
+      alert('识别失败：' + j.error);
     }
   } catch (e) {
     $('progress-text').textContent = '轮询失败：' + e.message;
+    busyProgress(null, '轮询失败：' + e.message);
   }
   if (done) {
     S.job = '';
@@ -420,7 +663,8 @@ async function pollJob() {
     $('btn-cancel').disabled = true;
     return;
   }
-  setTimeout(pollJob, 700);
+  await new Promise((r) => setTimeout(r, 700));
+  return pollJob();
 }
 
 async function applyResult(result) {
@@ -451,22 +695,30 @@ function previewScale() {
   return shown > 0 ? shown / 1920 : 0.33;
 }
 
-/** 视频在页面上的实际显示矩形（考虑 object-fit 的黑边与居中）。 */
+/** 视频在页面上的实际显示矩形（考虑 object-fit 的 letterbox）。
+ *
+ * 注意：`object-fit: contain` 下元素尺寸与画面尺寸不同——元素可能比
+ * 画面「更高/更宽」，两侧或上下留黑边。字幕必须按**画面**定位，
+ * 否则会偏到黑边上（实测字幕跑到画面外）。
+ */
 function videoRect() {
   const v = $('video');
   const frame = $('video-frame');
   const fr = frame.getBoundingClientRect();
+  const er = v.getBoundingClientRect();
   const vw = v.videoWidth || 16;
   const vh = v.videoHeight || 9;
-  const availW = fr.width || 1;
-  const availH = fr.height || 1;
+
+  // 元素在页面上的位置（相对 frame）与可用尺寸
+  const availW = er.width || fr.width || 1;
+  const availH = er.height || fr.height || 1;
   const k = Math.min(availW / vw, availH / vh);
   const w = Math.max(1, vw * k);
   const h = Math.max(1, vh * k);
   return {
     w, h,
-    left: (availW - w) / 2,
-    top: (availH - h) / 2,
+    left: (er.left - fr.left) + (availW - w) / 2,
+    top: (er.top - fr.top) + (availH - h) / 2,
   };
 }
 
@@ -1375,6 +1627,14 @@ function loadLayout() {
       const h = clamp(saved.drawer, 80, window.innerHeight * 0.5);
       $('drawer').style.height = h + 'px';
     }
+    // 兜底：如果此时预览高度不足（窗口变小、或旧布局把空间都占了），
+    // 主动收缩时间轴与日志，保证至少留出 260px 给视频。
+    //
+    // 注意不能用 requestAnimationFrame —— loadLayout 在 boot 早期调用，
+    // 那时 flex 尚未完成首帧布局，getBoundingClientRect 读到的是 0
+    // 或旧值，兜底会静默失效（实测坏布局仍然把预览压到 207px）。
+    // 用 setTimeout 等布局稳定后再校正。
+    setTimeout(ensurePreviewSpace, 120);
     // 左面板折叠状态
     restoreDetails(saved.details);
     // 面板显隐（用按钮的高亮状态保持一致）
@@ -1414,6 +1674,52 @@ function saveLayout() {
       drawerOpen: !$('drawer').classList.contains('collapsed'),
     }));
   } catch (e) { /* 忽略 */ }
+}
+
+/**
+ * 保证预览区有足够高度。
+ *
+ * 场景：用户之前把日志抽屉展开、时间轴拖得很高，布局被记忆下来；
+ * 下次打开（或换到更小的窗口）时预览会被压到很小，看起来像「没画面」。
+ * 这里主动回收空间，优先级：日志抽屉 → 时间轴。
+ *
+ * 保留 PREVIEW_MIN_H 给视频，低于此值才动手，避免干扰正常布局。
+ */
+const PREVIEW_MIN_H = 260;
+
+function ensurePreviewSpace() {
+  try {
+    const preview = $('preview');
+    if (!preview) return;
+    let need = PREVIEW_MIN_H - preview.getBoundingClientRect().height;
+    if (need <= 0) return;
+
+    // 1) 先从日志抽屉扣（最小保留 30px 的折叠条）
+    const drawer = $('drawer');
+    if (!drawer.classList.contains('collapsed')) {
+      const dh = drawer.getBoundingClientRect().height;
+      const take = Math.min(need, Math.max(0, dh - 30));
+      if (take > 0) {
+        const nh = Math.max(30, dh - take);
+        drawer.style.height = nh + 'px';
+        if (nh <= 30) setDrawer(false);
+        need -= take;
+      }
+    }
+    // 2) 还不够就压时间轴（最小保留 120px）
+    if (need > 0) {
+      const tl = $('timeline');
+      const th = tl.getBoundingClientRect().height;
+      const take = Math.min(need, Math.max(0, th - 120));
+      if (take > 0) {
+        const nh = Math.max(120, th - take) + 'px';
+        tl.style.height = nh;
+        tl.style.flexBasis = nh;
+      }
+    }
+    drawTimeline();
+    updateOverlay();
+  } catch (e) { /* 忽略：布局校正失败不应影响编辑 */ }
 }
 
 /** 恢复左面板折叠状态：按标题匹配，找不到就保持默认。 */

@@ -156,15 +156,17 @@ function stopBackend() {
 // ---------------- 窗口 ----------------
 
 function createWindow() {
-  // 自适应屏幕：按**工作区**（排除任务栏）计算，并留 4% 余量。
-  // 注意高 DPI 屏：Electron 的 size 是 DIP，若系统缩放 125%，
-  // 1440 DIP 实际会占 1800 物理像素，超出屏幕导致右侧面板被裁。
-  // 因此这里直接按工作区的 92%/90% 取尺寸，创建后再钳制一次。
+  // 自适应屏幕：按**工作区**（排除任务栏）计算，尽量占满高度。
+  //
+  // 历史问题：早期把高度硬限在 900，高 DPI 屏（如 175% 缩放）上
+  // workArea 只有 ~866 DIP，窗口一开就顶到屏幕边缘，预览区被压到
+  // 300px 左右，用户观感是「视频没了」。这里改为按工作区的 96%
+  // 取高度，并保留 720 的下限。
   const { screen } = require('electron');
   const disp = screen.getPrimaryDisplay();
   const work = disp.workAreaSize;
-  const width = Math.max(960, Math.min(1440, Math.round(work.width * 0.92)));
-  const height = Math.max(600, Math.min(900, Math.round(work.height * 0.90)));
+  const width = Math.max(960, Math.min(1600, Math.round(work.width * 0.96)));
+  const height = Math.max(720, Math.min(1200, Math.round(work.height * 0.96)));
 
   mainWindow = new BrowserWindow({
     width,

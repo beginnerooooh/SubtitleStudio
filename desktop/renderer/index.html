@@ -337,6 +337,21 @@
   </div>
 </div>
 
+<!-- ============ 全局阻塞进度层 ============
+     任何需要等待的操作都会弹出这个居中窗口：
+       - 遮罩挡住全部交互，避免等待期间重复点击
+       - 显示操作名 + 进度百分比 + 已用时间
+       - 超过一定时间才出现（快速操作不闪一下） -->
+<div id="busy" class="busy hidden">
+  <div class="busy-box">
+    <div class="busy-spinner"></div>
+    <div class="busy-text" id="busy-text">处理中…</div>
+    <div class="busy-sub" id="busy-sub"></div>
+    <div class="busy-track"><div class="busy-fill" id="busy-fill"></div></div>
+    <div class="busy-time" id="busy-time"></div>
+  </div>
+</div>
+
 <!-- ============ 右键菜单 ============ -->
 <div id="ctxmenu" class="ctxmenu hidden"></div>
 

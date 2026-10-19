@@ -105,6 +105,19 @@ You can enter every song performed in this stream:
 - Narrows the BGM decision space, **substantially reducing false "original vocal" flags**
 - Serves as the lyric source for line breaking, so subtitles split at the right phrases
 
+### Waiting Feedback
+
+Every operation that takes time shows a **centred progress dialog**:
+
+- Full-screen backdrop: clicks during the wait cannot trigger a second run
+  (more reliable than disabling buttons one by one, which always misses an entry point)
+- Shows the operation name, percentage, and elapsed time
+- Appears only after 120 ms, so fast requests do not flicker
+- One task at a time — a repeat trigger reports "the previous operation is still running"
+
+Covers: recognition, export, lyric fetch/import, voiceprint enrolment, cache cleanup,
+chat parsing, video transcoding, and project save/recover.
+
 ### Video Format Support
 
 Chromium can only play its own container set (MP4 / WebM / Ogg). For **FLV, MKV, TS, AVI,

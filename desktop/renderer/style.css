@@ -35,7 +35,7 @@ body {
   font: 12px/1.5 "Microsoft YaHei", "PingFang SC", "Segoe UI", system-ui, sans-serif;
   user-select: none;
 }
-#app { display: flex; flex-direction: column; height: 100vh; }
+#app { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 .mono { font-family: Consolas, "Cascadia Mono", monospace; }
 
 /* ---------------- 工具栏 ---------------- */
@@ -67,10 +67,15 @@ body {
 .save-state { font-size: 11px; color: var(--muted); min-width: 66px; text-align: right; }
 
 /* ---------------- 主编辑区 ---------------- */
+/* editor 用 flex:1 占据「工具栏与日志抽屉之间」的全部剩余高度，
+ * min-height:0 让内部可滚动而不撑破布局。 */
 .editor { display: flex; flex: 1 1 auto; min-height: 0; min-width: 0;
-          gap: 1px; background: var(--line); }
+          gap: 1px; background: var(--line); overflow: hidden; }
+/* 面板必须撑满编辑器高度（align-items 默认 stretch 时高度由容器决定），
+ * 但**不能**给 flex: 0 0 auto——那会让面板按内容高度收缩，底部露出空白
+ * （实测：左面板只有 457px，而编辑器区域高 600+）。 */
 .panel { background: var(--panel); display: flex; flex-direction: column;
-         flex: 0 0 auto; min-height: 0; }
+         flex: 0 0 auto; min-height: 0; align-self: stretch; }
 .panel-left { width: 224px; flex-basis: 224px; overflow-y: auto; }
 .panel-right { width: 268px; flex-basis: 268px; overflow: hidden; }
 .panel.hidden { display: none; }
@@ -145,14 +150,20 @@ body {
 .small { font-size: 10px; }
 
 /* 预览：视频与字幕叠在同一画面框内 */
-.stage { flex: 1 1 0; display: flex; flex-direction: column;
-         min-width: 0; min-height: 0; background: var(--bg); }.preview {
-  flex: 1 1 auto; min-height: 240px; width: 100%; position: relative;
+.stage {
+  flex: 1 1 0; display: flex; flex-direction: column;
+  min-width: 0; min-height: 0; background: var(--bg); overflow: hidden;
+}
+/* 预览区：纵向排列「画面框 + 播放条」。
+ * 关键：必须是 column——横向排列时 video-frame 与 playbar 都是
+ * width:100%，会争抢同一行宽度把画面框挤成 0 宽（实测导致视频 0x0）。 */
+/* 预览要能抢占剩余空间：flex-basis 用 0 而非 auto，
+ * 否则内容高度会把预览挤到最小（实测预览只剩 302px）。 */
+.preview {
+  flex: 1 1 0; min-height: 120px; width: 100%; position: relative;
   background: #0a0b0c;
-  /* 必须纵向排列：横向时 video-frame 与 playbar 都是 width:100%，
-   * 会争抢同一行宽度把画面框挤成 0 宽（实测导致视频 0x0 不显示）。 */
   display: flex; flex-direction: column; align-items: stretch;
-  padding: 8px 8px 0; overflow: hidden;
+  padding: 6px 6px 0; overflow: hidden;
 }
 /* 画面框：占满剩余高度，内部居中放视频 */
 .video-frame {
@@ -160,8 +171,17 @@ body {
   display: flex; align-items: center; justify-content: center;
   overflow: hidden;
 }
+/* 视频：在画面框内「等比缩放并完整显示」。
+ *
+ * 用 `width/height:100%` + `object-fit:contain`：元素撑满容器，
+ * 内容按比例 letterbox，既不变形也不超框。
+ *
+ * 历史 bug：早先用 `width:auto; height:auto` + max-* —— 浏览器会按
+ * 视频原始像素尺寸渲染，1080p 在窄框里只画一小块（表现为「视频很小」）；
+ * 改成单一 `height:100%` 又会把 16:9 压成扁条（实测 879×201）。
+ */
 #video {
-  max-width: 100%; max-height: 100%; width: auto; height: auto;
+  width: 100%; height: 100%;
   display: block; border-radius: 3px; background: #000;
   object-fit: contain;
 }
@@ -368,6 +388,61 @@ body {
 }
 #status-backend.ok { color: var(--ok); }
 #status-backend.err { color: var(--err); }
+
+/* ---------------- 全局阻塞进度层 ----------------
+ * 覆盖整个窗口并吃掉所有点击：这是「防止重复点击」的核心手段，
+ * 比逐个按钮 disable 可靠——不会漏掉某个入口。
+ */
+.busy {
+  position: fixed; inset: 0; z-index: 200;
+  background: rgba(0, 0, 0, .58);
+  display: flex; align-items: center; justify-content: center;
+  backdrop-filter: blur(2px);
+}
+.busy.hidden { display: none; }
+.busy-box {
+  min-width: 300px; max-width: 420px;
+  background: var(--panel); border: 1px solid var(--line-2);
+  border-radius: 10px; padding: 22px 26px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, .6);
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  animation: busy-in .16s ease-out;
+}
+@keyframes busy-in {
+  from { opacity: 0; transform: translateY(6px) scale(.98); }
+  to { opacity: 1; transform: none; }
+}
+.busy-spinner {
+  width: 30px; height: 30px; border-radius: 50%;
+  border: 3px solid var(--panel-3);
+  border-top-color: var(--accent);
+  animation: busy-spin .8s linear infinite;
+}
+@keyframes busy-spin { to { transform: rotate(360deg); } }
+.busy-text { font-size: 13px; font-weight: 600; text-align: center; }
+.busy-sub {
+  font-size: 11px; color: var(--muted); text-align: center;
+  max-width: 360px; word-break: break-all;
+}
+.busy-sub:empty { display: none; }
+.busy-track {
+  width: 100%; height: 5px; background: var(--panel-3);
+  border-radius: 3px; overflow: hidden;
+}
+.busy-fill {
+  height: 100%; width: 0; background: var(--accent);
+  transition: width .2s ease-out;
+}
+/* 不确定进度时用流动条纹，避免「卡在 0%」的错觉 */
+.busy-fill.indeterminate {
+  width: 40% !important;
+  animation: busy-slide 1.1s ease-in-out infinite;
+}
+@keyframes busy-slide {
+  0% { margin-left: -40%; }
+  100% { margin-left: 100%; }
+}
+.busy-time { font-size: 10px; color: var(--muted); font-family: Consolas, monospace; }
 
 /* ---------------- 右键菜单 ---------------- */
 .ctxmenu {

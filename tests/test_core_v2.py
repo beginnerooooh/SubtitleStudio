@@ -658,6 +658,81 @@ def test_flv_and_mkv_require_transcode():
         assert ext not in ds.TRANSCODE_CONTAINERS
 
 
+def test_hevc_is_not_browser_safe():
+    """回归：HEVC 不在浏览器可解码集合里。
+
+    这是 4GB 直播 FLV 黑屏的根因——只换容器（-c copy）把 HEVC 原样
+    搬进 MP4，Chromium 依然无法解码。
+    """
+    import desktop_server as ds
+
+    assert "hevc" not in ds.BROWSER_SAFE_VCODECS
+    assert "h264" in ds.BROWSER_SAFE_VCODECS
+    # 音频侧：AC-3 也不可播
+    assert "ac3" not in ds.BROWSER_SAFE_ACODECS
+    assert "aac" in ds.BROWSER_SAFE_ACODECS
+
+
+def test_transcode_args_skip_copy_for_unsafe_codec():
+    """回归：编码不安全时不能只 remux。"""
+    import desktop_server as ds
+
+    safe = ds._transcode_args(None, can_copy=True)
+    assert safe[0] == ["-c", "copy"], "可 remux 时应优先 copy"
+    unsafe = ds._transcode_args(None, can_copy=False)
+    assert all("copy" not in a for a in unsafe), \
+        "编码不安全时必须重编码，不能 copy"
+
+
+# ---------------- 阻塞进度层（防重复点击） ----------------
+
+def test_busy_overlay_exists_and_blocks_input():
+    html = _desktop_file("index.html")
+    css = _desktop_file("style.css")
+    js = _desktop_file("app.js")
+    assert 'id="busy"' in html, "缺少阻塞层节点"
+    assert 'id="busy-text"' in html and 'id="busy-fill"' in html
+    # 遮罩必须覆盖全屏且在最上层
+    seg = css[css.index(".busy {"):]
+    seg = seg[: seg.index("}") + 1]
+    assert "position: fixed" in seg and "inset: 0" in seg
+    assert "z-index" in seg
+    # JS 侧必须有显示/隐藏/进度/防重入
+    for fn in ("busyShow", "busyHide", "busyProgress", "withBusy"):
+        assert f"function {fn}" in js, f"缺少 {fn}"
+
+
+def test_api_json_wraps_slow_operations():
+    """回归：写操作应自动套阻塞层（防重复点击）。"""
+    js = _desktop_file("app.js")
+    assert "function apiLabel" in js
+    # 关键慢操作都要有可读标签
+    for kw in ("正在识别字幕", "正在导出", "正在拉取歌词", "正在提取声纹"):
+        assert kw in js, f"缺少操作标签：{kw}"
+    # 自动保存不应打扰用户
+    assert "autosave" in js
+
+
+def test_video_prepare_checks_transcode_status():
+    """回归：打开视频前先查转码状态并显示进度。"""
+    js = _desktop_file("app.js")
+    assert "preparePlayable" in js
+    assert "/api/transcode/status" in js
+    assert "HEVC" in js or "hevc" in js.lower()
+
+
+def test_codec_probe_is_cached_and_bounded():
+    """回归：编码探测要缓存且限制扫描范围（4GB 文件否则要 25 秒）。"""
+    import inspect
+
+    import desktop_server as ds
+
+    src = inspect.getsource(ds._probe_codecs)
+    assert "_CODEC_CACHE" in src, "编码探测必须缓存"
+    assert "-analyzeduration" in src and "-probesize" in src, \
+        "必须限制 ffprobe 扫描范围，否则大文件极慢"
+
+
 # ---------------- 弹幕 XML ----------------
 
 XML = """<?xml version="1.0" encoding="UTF-8"?>
