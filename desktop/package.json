@@ -1,0 +1,16 @@
+{
+  "name": "subtitle-studio-desktop",
+  "version": "2.0.0",
+  "description": "Subtitle Studio 桌面版 —— 本地字幕生成与校对编辑器",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0"
+  },
+  "author": "Subtitle Studio",
+  "license": "MIT"
+}

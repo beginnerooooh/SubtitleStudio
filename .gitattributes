@@ -1,0 +1,19 @@
+# 统一换行符：仓库内用 LF，检出时按平台处理
+* text=auto eol=lf
+
+# 二进制文件不做行尾转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.npy binary
+*.pt binary
+*.bin binary
+*.wav binary
+*.mp3 binary
+*.mp4 binary
+
+# Windows 脚本保留 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf

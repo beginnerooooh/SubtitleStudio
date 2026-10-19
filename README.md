@@ -1,0 +1,369 @@
+# Subtitle Studio
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
+[![Electron](https://img.shields.io/badge/Desktop-Electron-9feaf9.svg)](https://www.electronjs.org/)
+
+本地运行的直播 / 视频字幕生成与编辑工具。把录音或录像自动转成**可直接使用**的字幕，
+并提供一个对标剪辑软件的轻量桌面端，在时间轴上逐句校对、切分与调时。
+
+**核心特点**
+
+- **完全本地**：识别、声纹、歌词对齐都在本机跑，不上传任何音视频
+- **为直播优化**：处理唱歌、BGM 人声、多人闲聊等直播音频的典型难题
+- **可校对**：生成结果与人工校对样本逐行比对，给出可解释的准确率指标
+- **可编辑**：双轨时间轴 + 视频预览，字幕位置所见即所得
+
+---
+
+## 目录
+
+- [功能](#功能)
+- [快速开始](#快速开始)
+- [界面](#界面)
+- [工作方式](#工作方式)
+- [命令行](#命令行)
+- [后端 API](#后端-api)
+- [配置](#配置)
+- [项目结构](#项目结构)
+- [开发](#开发)
+- [已知限制](#已知限制)
+- [许可](#许可)
+
+---
+
+## 功能
+
+### 识别
+
+- **多引擎**：faster-whisper（large-v3 等）/ FunASR（paraformer-zh）/ 外部 HTTP 服务
+- **分块解码**：长音频按块解码并带重叠，避免模型静默跳过整段内容
+- **关闭 VAD**：直播中的歌声、弱起句容易被 VAD 吞掉，默认关闭
+- **时间轴校正**：用全片互相关把字幕覆盖曲线与音频活动度对齐
+- **智能切行**：按长度 / 标点 / 停顿做动态规划，输出符合阅读习惯的断句
+- **热词增强**：从弹幕 XML 提取高频昵称与术语，喂给引擎降低专名错误
+
+### 声纹与 BGM
+
+- **单目标声纹**：只判断「这段是不是当前主播」，说话 + 唱歌双音色
+- **多因子 BGM 判别**：声纹相似度 + 伴奏存在度 + 立体声侧信号 + 响度变异
+- **默认只标注不删除**：子窗级区分度有限，激进删除会误伤主播内容，因此默认把
+  疑似原唱的时间段与判定依据列出来，由用户确认
+
+### 歌曲
+
+四级链路，成本递增、命中即停：
+
+```
+弹幕/SC 点歌请求  →  本地歌词库  →  在线多源（NetEase / Kugou / LRCLIB）  →  识曲
+```
+
+在线多源支持**自动换源**：当某源的最佳版本与原唱歌手不符时，自动尝试下一个源。
+也可接入自建歌词服务。
+
+### 编辑
+
+- **双轨时间轴**：视频轨（胶片缩略）+ 字幕轨
+- **拖拽调时**：拖动片段移动、拖边缘改起止（左线绿=起点，右线橙=终点）
+- **批量框选**：空白处按住左键拖动框选，右键批量操作
+- **时间码**：统一 `时:分:秒:帧`，帧率取自视频
+- **字幕样式**：字号 / 颜色 / 描边 / 位置（预设或自由拖动）
+- **便利功能**：自动保存、撤销重做、草稿箱、崩溃恢复、缓存清理
+
+### 评测
+
+生成后可与人工校对样本对比，输出：
+
+- 行级完全匹配 / 文本一致 / 时间达标率
+- 字符错误率（CER）、字符召回率
+- **可达上限分析**（说明为什么 100% 不可能）
+- 仍需人工确认的边界情况清单
+
+---
+
+## 快速开始
+
+### 环境要求
+
+| 依赖 | 说明 |
+|---|---|
+| Python 3.10+ | 本项目在 3.12 上验证 |
+| FFmpeg | 音视频抽取与缩略图生成 |
+| Node.js 18+ | **仅桌面端需要**（构建期），运行时不依赖 |
+| NVIDIA GPU（可选） | 4GB 显存可跑 large-v3 int8_float16；无 GPU 会退到 CPU |
+
+### 安装
+
+```bash
+git clone https://github.com/beginnerooooh/SubtitleStudio.git
+cd SubtitleStudio
+
+# 创建虚拟环境并安装依赖
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+
+# 确认环境（会报告 GPU / FFmpeg / 可用引擎）
+python tools/cli.py info
+```
+
+> 首次使用会自动下载模型。如需完全离线，可预先将模型放入 `models/` 目录，
+> 具体路径见[配置](#配置)。
+
+### 生成你的第一条字幕
+
+```bash
+# 从视频生成字幕
+python tools/cli.py generate path/to/video.mp4
+
+# 带参考字幕自动评测
+python tools/cli.py generate path/to/video.mp4 --ref path/to/reference.srt
+
+# 结果在 outputs/<视频名>/<时间戳>/ 下（srt / lrc / ass / vtt / json）
+```
+
+### 启动图形界面
+
+**桌面版（推荐）**
+
+```bash
+cd desktop
+npm install      # 首次安装 Electron
+npm start
+```
+
+桌面端会自动拉起本地后端，无需手动装 Python 或记端口。
+
+**网页版（Gradio）**
+
+```bash
+python launcher.py          # 浏览器自动打开 http://127.0.0.1:7860
+python launcher.py --debug  # 保留控制台与 DEBUG 日志
+```
+
+---
+
+## 界面
+
+### 桌面端
+
+布局参考主流剪辑软件：
+
+```
+┌─ 工具栏：打开视频 · 弹幕 · 字幕 · 开始识别 · 撤销/重做 · 质检 · 导出 ────────┐
+├──────────┬──────────────────────────────────────┬──────────────────────┤
+│ 左面板    │  视频预览                            │ 字幕列表              │
+│ ▸ 素材    │   （字幕实时叠加，可拖动定位）        │  点击跳转             │
+│ ▸ 素材库  │                                      │  双击改字             │
+│ ▸ 识别设置│  ▶ 00:00:00:12 / 00:51:33:01 ══●═══  │  右键菜单             │
+│ ▸ 字幕样式├──────────────────────────────────────┤                      │
+│ ▸ 输出    │ 切分 合并 删除 新增│复制 粘贴│− + 适应│  150 行              │
+│          │ ┌──────────────────────────────────┐ │                      │
+│          │ │视频轨 ▓▓▒▒▓▓▒▒（胶片缩略）        │ │                      │
+│          │ │字幕轨 ███ ████ ██ ██████ ███      │ │                      │
+│          │ └──────────────────────────────────┘ │                      │
+├──────────┴──────────────────────────────────────┴──────────────────────┤
+│ 日志抽屉（默认收起）：日志 / 歌曲 / BGM 复核                             │
+└─ 状态栏 ────────────────────────────────────────────────────────────────┘
+```
+
+| 区域 | 能力 |
+|---|---|
+| **视频预览** | 字幕实时叠加，改样式立即生效；自由模式下可直接在画面上拖动字幕 |
+| **双轨时间轴** | 视频轨（胶片缩略，首次生成后缓存）+ 字幕轨（片段上显示字幕文字） |
+| **拖拽调时** | 拖动片段移动、拖左右边缘改起止；左线绿色=起点、右线橙色=终点 |
+| **批量框选** | 空白处按住左键拖动框选一批字幕，松开后右键批量操作 |
+| **时间码** | 全站统一 `时:分:秒:帧`（帧率取自视频） |
+| **时间轴区间** | 限制在 5 秒 ~ 10 分钟，滑块按对数刻度；「适应字幕」自动聚焦到可读密度 |
+| **可拉伸布局** | 四栏均可拖拽调节；拉伸时间轴时优先压缩日志、**预览高度不变** |
+| **状态记忆** | 面板显隐、折叠状态、各栏尺寸自动保存 |
+| **导出** | 自选格式与目录 |
+
+默认快捷键：`Space` 播放 · `Ctrl+Z`/`Ctrl+Shift+Z` 撤销重做 · `Ctrl+B` 切分 ·
+`Ctrl+M` 合并 · `Ctrl+C`/`Ctrl+V` 复制粘贴 · `Ctrl+D` 原地复制 · `Delete` 删除 ·
+`Ctrl+S` 导出 · `←`/`→` 前后 0.5 秒。全部可在「快捷键」对话框中自定义。
+
+### 网页版（Gradio）
+
+五个页签：生成 / 校对编辑器 / 评测对比 / 声纹与歌词 / 设置。适合无 Electron
+环境或需要远程使用的场景。
+
+---
+
+## 工作方式
+
+处理流水线（`app/core/pipeline2.py`）：
+
+```
+音视频输入
+  → 音频抽取（16k 单声道 WAV）
+  → 人声分离（可选）
+  → 声纹 / BGM 分析（可选）
+  → 识别（分块解码 + 独占区间去重）
+  → 歌曲检测与歌词对齐（可选）
+  → 切行（DP）+ 标点恢复
+  → 时间轴校正
+  → 去重 / 重叠修复 / 单调化
+  → 导出 + 评测
+```
+
+**关键设计取舍**（均有实测支撑，详见 [docs/EVALUATION.md](docs/EVALUATION.md)）：
+
+- **关闭 VAD**：Silero VAD 会吞掉歌声与弱起句，导致整段丢失
+- **分块 + 重叠**：whisper 对长音频会静默跳过内容（实测跳过 26 秒）
+- **BGM 只标注不删除**：子窗级判别准确率约 0.76，不足以自动删除
+- **不使用标点做最终文本**：标点只作为切行线索，最终文本以识别结果为准
+
+---
+
+## 命令行
+
+```bash
+# 生成字幕
+python tools/cli.py generate <video> [--ref <srt>] [--chunk 120] [--engine whisper]
+
+# 评测两份字幕（CI 可用 --max-cer 设置阈值，超限返回非零码）
+python tools/cli.py evaluate --ref <srt> --hyp <srt> --json
+
+# 批量处理目录
+python tools/cli.py batch <dir>
+
+# 环境与默认参数
+python tools/cli.py info
+```
+
+---
+
+## 后端 API
+
+`app/desktop_server.py` 提供本地 HTTP 接口（标准库实现，无额外依赖），
+桌面端与网页端共用同一套逻辑。
+
+| 接口 | 说明 |
+|---|---|
+| `GET /api/health` | 环境与可用引擎 / 歌词源 |
+| `GET/POST/DELETE /api/projects[...]` | 项目 CRUD、保存、自动保存、撤销/重做、导出 |
+| `POST /api/edit/<op>` | 无状态编辑：split / merge / delete / insert / update / retime_edge / copy / paste / duplicate / qc |
+| `POST /api/generate` · `GET /api/jobs/<id>` | 异步生成任务与进度轮询 |
+| `POST /api/evaluate` | 评测 |
+| `GET/POST /api/lyrics/*` | 歌词源列表、检索、配置自建服务 |
+| `GET /api/media?path=` | 媒体流（支持 Range） |
+| `GET /api/videoinfo?path=` | 帧率与时长（供时间码） |
+| `GET /api/thumbs?path=` | 时间轴胶片缩略图 |
+| `GET /api/danmaku?path=` | 弹幕摘要（主播 / 礼物 / 点歌 / 热词） |
+| `GET/POST /api/cache/*` · `/api/drafts/clean` | 缓存统计与清理、草稿清理 |
+| `GET/POST /api/profiles[...]` | 声纹列表、注册、删除 |
+
+---
+
+## 配置
+
+默认值集中在 `app/core/config.py`，全部支持环境变量覆盖。常用项：
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `SS_DEVICE` | `auto` | `auto` / `cuda` / `cpu` |
+| `SS_MODELS_DIR` | `models` | 模型目录 |
+| `SS_CACHE_DIR` | `cache` | 可再生成的中间产物 |
+| `SS_OUTPUT_DIR` | `outputs` | 生成结果 |
+| `SS_ASR_ENGINE` | `whisper` | 默认引擎 |
+| `SS_LYRIC_PROVIDERS` | `netease,kugou,lrclib` | 歌词源顺序 |
+
+模型放置约定：
+
+```
+models/
+  ct2/<model>/            faster-whisper 模型（CTranslate2 格式）
+  hf/                     HuggingFace 缓存（声纹 ECAPA、人声分离）
+  modelscope/             ModelScope 缓存（FunASR、时间戳预测）
+```
+
+---
+
+## 项目结构
+
+```
+app/
+  app.py                 网页版界面（Gradio）
+  desktop_server.py      桌面端本地 API（标准库 HTTP）
+  core/
+    pipeline2.py         流水线编排
+    providers/           可插拔识别后端（whisper / funasr / external）
+    segmenter.py         切行动态规划
+    punctuate.py         标点恢复（仅作切行线索）
+    timing.py            时间轴校正
+    bgm.py               BGM 人声多因子判别
+    song.py              歌曲检测 / 歌词多源检索 / 强制对齐
+    streamer.py          单目标声纹（说话 + 唱歌双音色）
+    livexml.py           弹幕 / 礼物 / SC / 舰长 XML 解析
+    store.py             项目 / 草稿 / 撤销 / 自动保存 / 缓存清理
+    evaluate.py          评测与边界情况分析
+    editor.py            编辑操作（纯函数）
+    subtitle.py          多格式导出
+    separator.py         人声分离（Demucs）
+    audio.py             音频抽取与探测
+    models.py            数据模型（SubtitleLine / Word）
+    text.py              文本规范化
+    env.py               环境探测（设备 / FFmpeg）
+    config.py            集中配置
+desktop/                 Electron 桌面应用
+  main.js                主进程（拉起后端、窗口、菜单）
+  preload.js             安全桥
+  renderer/              界面（HTML / CSS / JS）
+docs/EVALUATION.md       评测报告（含根因分析与复现方法）
+tools/cli.py             命令行
+tools/check_desktop_ids.py  桌面端元素 ID 一致性检查
+tests/test_core_v2.py    单元测试（80 项，不依赖 GPU）
+```
+
+---
+
+## 开发
+
+```bash
+# 运行测试（不依赖 GPU）
+python -m pytest tests/ -q
+
+# 检查桌面端元素 ID 一致性（防止 JS 引用失效的节点）
+python tools/check_desktop_ids.py
+
+# 启动后端（配合浏览器调试界面）
+python app/desktop_server.py
+```
+
+代码约定：
+
+- `core/` 下模块保持**纯函数优先**，便于测试与撤销
+- 编辑操作不修改入参，返回新列表
+- 桌面端只做 UI 与交互，业务逻辑一律走后端 API
+- 提交前请确保 `pytest` 与 `check_desktop_ids.py` 均通过
+
+---
+
+## 已知限制
+
+- **100% 精确匹配不可达**：本地 ASR 对真人直播的字符正确率约 73%，
+  即使切行完美，文本完全一致的行上限约 36%。继续逼近需要外部文本源
+  （歌词库 / 弹幕 / 用户文稿）。
+- **BGM 判别默认只标注**：子窗级声纹区分度有限，自动删除会误伤主播内容。
+- **歌曲识别依赖网络**：在线歌词源需要联网；离线只能用本地歌词库。
+- **弹幕 XML 目前覆盖 BililiveRecorder 2.x 格式**，其他平台需补充解析。
+- **无 GPU 时速度较慢**：建议用 `medium` 或 `small` 模型。
+
+---
+
+## 致谢
+
+本项目基于以下开源工作构建：
+
+- [faster-whisper](https://github.com/SYSTRAN/faster-whisper) / [CTranslate2](https://github.com/OpenNMT/CTranslate2)
+- [FunASR](https://github.com/modelscope/FunASR) / [ModelScope](https://modelscope.cn/)
+- [SpeechBrain](https://speechbrain.github.io/)（ECAPA-TDNN 声纹）
+- [Demucs](https://github.com/facebookresearch/demucs)（人声分离）
+- [Gradio](https://gradio.app/) · [Electron](https://www.electronjs.org/) · [FFmpeg](https://ffmpeg.org/)
+
+---
+
+## 许可
+
+[MIT License](LICENSE)

@@ -1,0 +1,914 @@
+"""新模块单测：切行 / 评测 / 编辑 / 弹幕 / 配置 / 外部接口解析。
+
+这些测试不依赖 GPU 与模型，可在 CI 中快速跑完：
+    pytest tests/test_core_v2.py -q
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "app"))
+
+from core import editor as ed                        # noqa: E402
+from core.config import AppConfig                     # noqa: E402
+from core.evaluate import EvalLine, evaluate, normalize_text, parse_srt  # noqa: E402
+from core.livexml import parse_xml                    # noqa: E402
+from core.models import SubtitleLine, SubtitleWord    # noqa: E402
+from core.segmenter import SegmentTuning, segment_words, split_atoms  # noqa: E402
+
+
+# ---------------- 切行 ----------------
+
+def _words(chars: str, step: float = 0.3) -> list[SubtitleWord]:
+    return [SubtitleWord(text=c, start=round(i * step, 3),
+                         end=round((i + 1) * step, 3))
+            for i, c in enumerate(chars)]
+
+
+def test_split_atoms_splits_cjk_words():
+    words = [SubtitleWord(text="晚上好", start=0.0, end=0.9)]
+    atoms = split_atoms(words)
+    assert [a.text for a in atoms] == ["晚", "上", "好"]
+    assert atoms[0].start == 0.0 and atoms[-1].end == 0.9
+
+
+def test_split_atoms_keeps_latin_words():
+    words = [SubtitleWord(text="Butterfly", start=0.0, end=0.6),
+             SubtitleWord(text="都忘了", start=0.6, end=1.2)]
+    atoms = split_atoms(words)
+    assert atoms[0].text == "Butterfly"
+    assert [a.text for a in atoms[1:]] == ["都", "忘", "了"]
+
+
+def test_segment_respects_punctuation_hint():
+    """标点线索应把句子在标点处断开（hints[i] = 第 i 个原子之后断行）。"""
+    chars = "晚上好晚上好大家好"
+    words = _words(chars)
+    hints = [False] * len(chars)
+    hints[4] = True          # 第 5 个字之后断
+    tuning = SegmentTuning(min_chars=2, max_chars=20, target_chars=9,
+                           w_clause=30.0)
+    lines = segment_words(words, tuning, punctuation=hints)
+    texts = [ln.text for ln in lines]
+    assert texts[0] == chars[:5]
+    assert "".join(texts) == chars
+    assert len(lines) >= 2
+
+
+def test_segment_preserves_all_characters():
+    chars = "要多努力才走得到远方如果梦想不曾绝望"
+    words = _words(chars)
+    lines = segment_words(words, SegmentTuning())
+    assert "".join(ln.text for ln in lines) == chars
+
+
+def test_segment_no_overlap_and_ordered():
+    words = _words("abcdefghij" * 5)
+    lines = segment_words(words, SegmentTuning(max_chars=8))
+    for a, b in zip(lines, lines[1:]):
+        assert a.end <= b.start + 1e-6
+
+
+def test_segment_max_chars_respected():
+    words = _words("字" * 60)
+    lines = segment_words(words, SegmentTuning(max_chars=10))
+    assert all(len(ln.text) <= 10 for ln in lines)
+
+
+# ---------------- 评测 ----------------
+
+def test_normalize_text_removes_punct_and_spaces():
+    assert normalize_text("晚上好，晚上好！") == "晚上好晚上好"
+    assert normalize_text("hello world") == "helloworld"
+
+
+def test_parse_srt_handles_crlf_and_bom():
+    body = ("\ufeff1\r\n00:00:07,083 --> 00:00:08,683\r\n晚上好\r\n\r\n"
+            "2\r\n00:00:15,200 --> 00:00:16,933\r\n晚上好呀\r\n")
+    lines = parse_srt(body)
+    assert len(lines) == 2
+    assert lines[0].start == pytest.approx(7.083)
+    assert lines[1].text == "晚上好呀"
+
+
+def test_evaluate_perfect_match():
+    ref = [EvalLine(0.0, 1.0, "你好世界"), EvalLine(2.0, 3.0, "再见")]
+    hyp = [EvalLine(0.0, 1.0, "你好世界"), EvalLine(2.0, 3.0, "再见")]
+    report = evaluate(ref, hyp)
+    assert report.exact_match_rate == 1.0
+    assert report.cer == 0.0
+    assert report.missing == 0 and report.extra == 0
+
+
+def test_evaluate_counts_mismatches_and_marks_boundary_cases():
+    ref = [EvalLine(0.0, 1.0, "你好世界"), EvalLine(2.0, 3.0, "再见")]
+    hyp = [EvalLine(0.0, 1.0, "你好时间"), EvalLine(2.6, 3.4, "再见")]
+    report = evaluate(ref, hyp)
+    assert report.ref_count == 2
+    assert report.exact_text_lines == 1
+    assert report.missing == 0
+    assert any(c["kind"].startswith("文本") for c in report.boundary_cases)
+    assert any("时间偏移" in c["kind"] for c in report.boundary_cases)
+
+
+def test_evaluate_detects_missing_and_extra_lines():
+    ref = [EvalLine(0.0, 1.0, "甲"), EvalLine(5.0, 6.0, "乙")]
+    hyp = [EvalLine(0.0, 1.0, "甲"), EvalLine(20.0, 21.0, "丙")]
+    report = evaluate(ref, hyp)
+    assert report.missing == 1
+    assert report.extra == 1
+
+
+def test_report_serialises_to_json():
+    report = evaluate([EvalLine(0.0, 1.0, "abc")], [EvalLine(0.0, 1.0, "abc")])
+    data = report.to_dict()
+    assert data["exact_match_rate"] == 1.0
+    assert "boundary_cases" in data
+
+
+# ---------------- 编辑器 ----------------
+
+def _line(text: str, start: float, end: float) -> SubtitleLine:
+    return SubtitleLine(words=[SubtitleWord(text=text, start=start, end=end)])
+
+
+def test_editor_split_line():
+    lines = [_line("晚上好晚上好", 7.0, 9.0)]
+    out, msg = ed.split_line(lines, 0, 3)
+    assert len(out) == 2
+    assert out[0].text == "晚上好" and out[1].text == "晚上好"
+    assert out[0].start == 7.0 and out[1].end == 9.0
+    assert "切分" in msg
+
+
+def test_editor_merge_lines():
+    lines = [_line("甲", 0.0, 1.0), _line("乙", 1.0, 2.0), _line("丙", 2.0, 3.0)]
+    out, _msg = ed.merge_lines(lines, [0, 1])
+    assert len(out) == 2
+    assert out[0].text == "甲乙"
+    assert out[0].start == 0.0 and out[0].end == 2.0
+
+
+def test_editor_merge_requires_contiguous():
+    lines = [_line("甲", 0.0, 1.0), _line("乙", 1.0, 2.0), _line("丙", 2.0, 3.0)]
+    out, msg = ed.merge_lines(lines, [0, 2])
+    assert len(out) == 3
+    assert "连续" in msg
+
+
+def test_editor_delete_and_insert():
+    lines = [_line("甲", 0.0, 1.0), _line("乙", 1.0, 2.0)]
+    out, _ = ed.delete_lines(lines, [0])
+    assert [ln.text for ln in out] == ["乙"]
+    out2, _ = ed.insert_line(out, 0, "新", 0.0, 0.9)
+    assert [ln.text for ln in out2] == ["新", "乙"]
+
+
+def test_editor_update_clamps_to_neighbours():
+    lines = [_line("甲", 0.0, 1.0), _line("乙", 1.0, 2.0)]
+    out, _ = ed.update_line(lines, 0, end=5.0)
+    assert out[0].end <= out[1].start
+
+
+def test_editor_shift_and_overlap_fix():
+    lines = [_line("甲", 0.0, 1.0), _line("乙", 1.5, 2.5)]
+    out, _ = ed.shift_lines(lines, 0.8, index=0)
+    assert out[0].start == pytest.approx(0.8)
+    fixed, msg = ed.fix_overlaps(out)
+    assert fixed[0].end <= fixed[1].start
+    assert "重叠" in msg
+
+
+def test_editor_parse_ts_formats():
+    assert ed.parse_ts("01:02.500") == pytest.approx(62.5)
+    assert ed.parse_ts("00:01:02,500") == pytest.approx(62.5)
+    assert ed.parse_ts("12.5") == pytest.approx(12.5)
+    with pytest.raises(ValueError):
+        ed.parse_ts("abc")
+
+
+def test_editor_does_not_mutate_input():
+    lines = [_line("甲", 0.0, 1.0)]
+    before = [(ln.start, ln.end, ln.text) for ln in lines]
+    ed.split_line(lines, 0, 1)
+    after = [(ln.start, ln.end, ln.text) for ln in lines]
+    assert before == after
+
+
+# ---------------- 剪辑式操作（拖动/复制/粘贴） ----------------
+
+def test_retime_edge_changes_only_one_side():
+    lines = [_line("甲", 1.0, 3.0)]
+    out, msg = ed.retime_edge(lines, 0, end=5.0)
+    assert out[0].start == pytest.approx(1.0)
+    assert out[0].end == pytest.approx(5.0)
+    out2, _ = ed.retime_edge(lines, 0, start=0.5)
+    assert out2[0].start == pytest.approx(0.5)
+    assert out2[0].end == pytest.approx(3.0)
+    assert "终点" in msg
+
+
+def test_retime_edge_enforces_min_duration():
+    lines = [_line("甲", 1.0, 3.0)]
+    out, _ = ed.retime_edge(lines, 0, end=1.05, min_dur=0.5)
+    assert out[0].end - out[0].start >= 0.5 - 1e-9
+
+
+def test_retime_edge_allows_crossing_neighbours():
+    """拖拽不做相邻夹紧（剪辑软件手感）；重叠由后续质检处理。"""
+    lines = [_line("甲", 0.0, 2.0), _line("乙", 2.0, 4.0)]
+    out, _ = ed.retime_edge(lines, 0, end=3.5)
+    assert out[0].end == pytest.approx(3.5)
+
+
+def test_copy_and_paste_preserves_relative_gaps():
+    lines = [_line("甲", 1.0, 3.0), _line("乙", 4.0, 6.0)]
+    data, msg = ed.copy_lines(lines, [0, 1])
+    assert len(data) == 2 and "复制" in msg
+    out, msg2 = ed.paste_lines(lines, data, at=20.0)
+    starts = sorted(ln.start for ln in out)
+    # 粘贴后保持 1s 的原始间隔（4.0 - 3.0）
+    assert starts == pytest.approx([1.0, 4.0, 20.0, 23.0])
+    assert "粘贴" in msg2
+
+
+def test_paste_keeps_timeline_monotonic():
+    lines = [_line("甲", 1.0, 3.0)]
+    data, _ = ed.copy_lines(lines, [0])
+    out, _ = ed.paste_lines(lines, data, at=50.0)
+    assert all(out[i].start <= out[i + 1].start for i in range(len(out) - 1))
+
+
+def test_paste_empty_clipboard_is_safe():
+    lines = [_line("甲", 1.0, 3.0)]
+    out, msg = ed.paste_lines(lines, [], at=5.0)
+    assert len(out) == 1 and "空" in msg
+
+
+def test_duplicate_offsets_time_to_avoid_overlap():
+    lines = [_line("甲", 1.0, 3.0)]
+    out, msg = ed.duplicate_lines(lines, [0])
+    assert len(out) == 2
+    assert out[0].end <= out[1].start + 1e-9   # 不重叠
+    assert out[1].end - out[1].start == pytest.approx(2.0)  # 保持时长
+    assert "复制" in msg
+
+
+# ---------------- 项目存储：撤销/草稿/缓存 ----------------
+
+def test_store_undo_redo_roundtrip(tmp_path):
+    from core.store import ProjectStore
+
+    st = ProjectStore(tmp_path / "projects")
+    state = st.create(video="x.mp4", name="测试")
+    state.lines = [{"start": 0, "end": 1, "text": "A", "words": []}]
+    st.save(state, push_history=True, note="first")
+    state.lines = [{"start": 0, "end": 1, "text": "B", "words": []}]
+    st.save(state, push_history=True, note="second")
+
+    back = st.undo(state.meta.id)
+    assert back is not None and back.lines[0]["text"] == "A"
+    again = st.redo(state.meta.id)
+    assert again is not None and again.lines[0]["text"] == "B"
+    info = st.history_info(state.meta.id)
+    assert info["undo"] >= 1
+
+
+def test_store_draft_flag_and_rename(tmp_path):
+    from core.store import ProjectStore
+
+    st = ProjectStore(tmp_path / "projects")
+    draft = st.create(name="未命名")
+    assert draft.meta.draft is True
+    formal = st.create(name="正式项目")
+    assert formal.meta.draft is False
+    st.rename(draft.meta.id, "改好名字了")
+    assert all(m.draft is False for m in st.list_projects()
+               if m.id == draft.meta.id)
+
+
+def test_store_autosave_and_recover(tmp_path):
+    from core.store import ProjectStore
+
+    st = ProjectStore(tmp_path / "projects")
+    state = st.create(name="自动保存测试")
+    state.lines = [{"start": 0, "end": 2, "text": "自动保存内容", "words": []}]
+    assert st.autosave(state) is True
+    rec = st.recover_autosave(state.meta.id)
+    assert rec and rec[0]["text"] == "自动保存内容"
+
+
+def test_store_clean_cache_only_touches_target_dir(tmp_path):
+    """缓存清理只动 cache 目录，绝不碰 projects/profiles/lyrics。"""
+    from core.store import ProjectStore
+
+    st = ProjectStore(tmp_path / "projects")
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    stale = cache / "old.wav"
+    stale.write_bytes(b"x" * 2048)
+    keep = tmp_path / "profiles"
+    keep.mkdir()
+    voice = keep / "主播.npy"
+    voice.write_bytes(b"y" * 1024)
+    import os
+    import time as _t
+
+    old = _t.time() - 30 * 86400
+    os.utime(stale, (old, old))
+    stats = st.clean_cache(cache, max_age_days=7)
+    assert stats["files"] == 1
+    assert not stale.exists()
+    assert voice.exists(), "声纹文件被误删"
+
+
+def test_store_delete_removes_project(tmp_path):
+    from core.store import ProjectStore
+
+    st = ProjectStore(tmp_path / "projects")
+    state = st.create(name="待删除")
+    st.delete(state.meta.id)
+    assert st.list_projects() == []
+    with pytest.raises(FileNotFoundError):
+        st.load(state.meta.id)
+
+
+# ---------------- 外部歌词接口 ----------------
+
+def test_custom_lyric_provider_parses_plain_lrc():
+    from core.song import CustomLyricProvider
+
+    # 无网络时返回空（安全降级）
+    p = CustomLyricProvider("http://127.0.0.1:9/never", timeout=0.5)
+    assert p.search(title="x") == []
+
+
+def test_set_custom_endpoint_registers_provider():
+    from core.song import PROVIDERS, set_custom_endpoint
+
+    name = set_custom_endpoint("http://127.0.0.1:1/lyrics", "k")
+    assert name == "custom" and "custom" in PROVIDERS
+
+
+# ---------------- 桌面端源码约定（防止回归） ----------------
+
+def _desktop_file(name: str) -> str:
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent / "desktop" / "renderer"
+    return (root / name).read_text(encoding="utf-8")
+
+
+def test_overlay_only_falls_back_to_selection_when_paused():
+    """回归：选中字幕后播放到无字幕处，不应继续显示该字幕。
+
+    实现约定：updateOverlay 的选中回退必须同时满足
+    `_previewSelection` 与 `v.paused` 两个条件。
+    """
+    js = _desktop_file("app.js")
+    assert "_previewSelection" in js
+    # 回退条件必须是「预览标志 + 暂停」双条件
+    seg = js[js.index("function updateOverlay"):]
+    seg = seg[: seg.index("\nfunction ", 1)] if "\nfunction " in seg[1:] else seg
+    assert "_previewSelection" in seg and "v.paused" in seg, \
+        "updateOverlay 的选中回退必须受 _previewSelection 与 paused 双重约束"
+
+
+def test_video_uses_absolute_url():
+    """回归：渲染层是 file:// 页面，媒体 URL 必须带 http 前缀。"""
+    js = _desktop_file("app.js")
+    assert "mediaUrl" in js
+    assert "`${API_BASE()}/api/media" in js, "媒体地址必须用绝对 URL"
+
+
+def test_preview_container_is_column_flex():
+    """回归：.preview 必须是纵向 flex，否则画面框会被播放条挤成 0 宽。"""
+    css = _desktop_file("style.css")
+    seg = css[css.index(".preview {"):]
+    seg = seg[: seg.index("}") + 1]
+    assert "flex-direction: column" in seg
+    # 预览要有最小高度，避免被时间轴/日志拉伸压没
+    assert "min-height" in seg
+
+
+def test_splitters_do_not_shrink_preview():
+    """回归：拖时间轴时应从日志抽屉扣空间，而不是压预览。"""
+    js = _desktop_file("app.js")
+    seg = js[js.index("$('split-timeline')"): ]
+    seg = seg[: seg.index("$('split-drawer')")]
+    assert "drawer" in seg, "拉伸时间轴必须优先压缩日志抽屉"
+
+
+def test_zoom_control_exists_and_updates_label():
+    js = _desktop_file("app.js")
+    html = _desktop_file("index.html")
+    assert 'id="zoom"' in html and 'id="zoom-label"' in html
+    assert "zoom-label" in js and "setZoom" in js
+
+
+def test_clip_shows_text():
+    """回归：字幕轨片段必须渲染对应文字。"""
+    js = _desktop_file("app.js")
+    assert "clip-text" in js, "片段上必须渲染文字节点"
+    css = _desktop_file("style.css")
+    # 极窄片段要去掉 padding，否则宽度会被撑大、缩放失效
+    assert ".clip.tiny" in css
+    assert "min-width: 0" in css
+
+
+def test_collapse_state_is_remembered():
+    """回归：左面板折叠状态要持久化并能恢复。"""
+    js = _desktop_file("app.js")
+    assert "restoreDetails" in js and "bindDetailsMemory" in js
+    assert "toggle" in js, "折叠变化应触发保存"
+    # saveLayout 必须记录 details
+    seg = js[js.index("function saveLayout"):]
+    seg = seg[: seg.index("\n}")]
+    assert "details" in seg
+
+
+def test_zoom_percentage_baseline_is_min_span():
+    """回归：比例以最短区间（5 秒）为 100% 基准。"""
+    js = _desktop_file("app.js")
+    seg = js[js.index("function updateZoomUI"):]
+    seg = seg[: seg.index("\n}")]
+    assert "SPAN_MIN / span * 100" in seg, \
+        "比例必须用 SPAN_MIN / span 计算（最短区间 = 100%）"
+
+
+def test_span_limits_are_5s_and_10min():
+    js = _desktop_file("app.js")
+    assert "SPAN_MIN = 5" in js, "最短区间应为 5 秒"
+    assert "SPAN_MAX = 10 * 60" in js, "最长区间应为 10 分钟"
+
+
+def test_timecode_uses_hhmmssff():
+    """回归：时间统一用「时:分:秒:帧」，且能往返解析。"""
+    js = _desktop_file("app.js")
+    assert "function fmtTC" in js and "function parseTC" in js
+    seg = js[js.index("function fmtTC"):]
+    seg = seg[: seg.index("\n}")]
+    # 必须包含时/分/秒/帧四段
+    for part in ("hh", "mm", "ss"):
+        assert part in seg
+    assert "FPS" in js, "帧率必须来自视频信息"
+
+
+def test_overlay_handle_removed():
+    """回归：自由模式的辅助点已删除，不应再出现。"""
+    html = _desktop_file("index.html")
+    js = _desktop_file("app.js")
+    assert 'id="ov-handle"' not in html, "辅助点节点应已删除"
+    assert "ov-handle" not in js, "辅助点逻辑应已删除"
+    css = _desktop_file("style.css")
+    assert ".ov-handle" not in css, "辅助点样式应已删除"
+
+
+def test_marquee_selection_exists():
+    """回归：支持按住左键框选批量选择。"""
+    html = _desktop_file("index.html")
+    js = _desktop_file("app.js")
+    assert 'id="marquee"' in html
+    assert "beginMarquee" in js and "onMarquee" in js and "endMarquee" in js
+
+
+def test_clip_edges_have_distinct_colors():
+    """回归：左右拖拽线用不同颜色。"""
+    css = _desktop_file("style.css")
+    assert "--edge-l:" in css and "--edge-r:" in css
+    # 两者取值必须不同
+    import re
+
+    l = re.search(r"--edge-l:\s*([^;]+);", css).group(1).strip()
+    r = re.search(r"--edge-r:\s*([^;]+);", css).group(1).strip()
+    assert l != r, "左右拖拽线颜色必须不同"
+
+
+# ---------------- 弹幕 XML ----------------
+
+XML = """<?xml version="1.0" encoding="UTF-8"?>
+<i>
+  <BililiveRecorderRecordInfo roomid="12345" name="测试主播" title="测试标题"
+      start_time="2026-10-07T20:09:36.2003498+08:00" />
+  <d p="12.34,1,25,16777215,1696000000000,0,abc123,0" user="用户甲">主播晚上好</d>
+  <d p="15.00,1,25,16777215,1696000003000,0,def456,0" user="用户乙">点一首七里香</d>
+  <gift ts="39.943" user="用户丙" uid="ghi789" giftname="粉丝团灯牌" giftcount="2" />
+  <sc ts="211.5" user="用户丁" uid="jkl012" price="50" time="120">想听《发如雪》</sc>
+  <guard ts="112.018" user="用户戊" uid="mno345" level="3" count="1" />
+</i>
+"""
+
+
+def test_parse_xml_basic(tmp_path):
+    """真实录播姬格式：昵称在 user 属性、礼物/SC/舰长是独立节点。"""
+    p = tmp_path / "danmaku.xml"
+    p.write_text(XML, encoding="utf-8")
+    log = parse_xml(p)
+    assert len(log.danmaku) == 2
+    assert log.danmaku[0].time == pytest.approx(12.34)
+    assert log.danmaku[0].text == "主播晚上好"
+    assert log.danmaku[0].user_id == "abc123"
+    # 昵称取自 user 属性（旧实现误取 p 的第 8 段，恒为 0）
+    assert log.danmaku[0].user_name == "用户甲"
+    # 礼物/SC/舰长分别解析
+    kinds = sorted(g.kind for g in log.gifts)
+    assert kinds == ["gift", "guard", "sc"]
+    gift = next(g for g in log.gifts if g.kind == "gift")
+    assert gift.gift == "粉丝团灯牌" and gift.count == 2
+    sc = next(g for g in log.gifts if g.kind == "sc")
+    assert sc.price == 50 and "发如雪" in sc.text
+    guard = next(g for g in log.gifts if g.kind == "guard")
+    assert guard.gift == "舰长"
+    # 录制信息
+    assert log.streamer == "测试主播" and log.title == "测试标题"
+    assert log.room_id == "12345" and log.started_at > 0
+
+
+def test_song_requests_from_danmaku_and_sc(tmp_path):
+    """点歌请求：弹幕与 SC 都能提取出歌名（这是最可靠的歌曲来源）。"""
+    p = tmp_path / "danmaku.xml"
+    p.write_text(XML, encoding="utf-8")
+    log = parse_xml(p)
+    reqs = log.song_requests()
+    names = [n for _t, _u, n in reqs]
+    assert "七里香" in names
+    assert "发如雪" in names
+
+
+def test_hotwords_include_user_names(tmp_path):
+    p = tmp_path / "danmaku.xml"
+    p.write_text(XML, encoding="utf-8")
+    log = parse_xml(p)
+    words = log.hotwords(top=20)
+    assert "用户甲" in words or "用户乙" in words
+
+
+def test_parse_xml_repairs_truncated_file(tmp_path):
+    """录制中断产生的截断 XML 也要能解析（保留弹幕与录制信息）。"""
+    p = tmp_path / "broken.xml"
+    p.write_text(XML.rsplit("</i>", 1)[0], encoding="utf-8")
+    log = parse_xml(p)
+    assert len(log.danmaku) == 2
+    assert len(log.gifts) == 3
+    # 截断修复时不应丢掉 RecordInfo（主播名/标题）
+    assert log.streamer == "测试主播"
+
+
+def test_hotwords_exclude_stopwords():
+    from core.livexml import Danmaku, LiveLog
+
+    log = LiveLog(danmaku=[
+        Danmaku(1.0, "哈哈哈哈", user_name="观众A"),
+        Danmaku(2.0, "主播唱得好", user_name="铁粉老王"),
+        Danmaku(3.0, "铁粉老王 送你 盲盒 x2"),
+    ])
+    words = log.hotwords(top=10)
+    assert "铁粉老王" in words
+    assert "哈哈哈哈" not in words
+
+
+# ---------------- 配置 ----------------
+
+def test_config_env_overrides(monkeypatch):
+    monkeypatch.setenv("SUBTITLE_STUDIO_ASR_MODEL", "medium")
+    monkeypatch.setenv("SUBTITLE_STUDIO_VAD", "1")
+    cfg = AppConfig.from_env()
+    assert cfg.asr.model == "medium"
+    assert cfg.asr.vad_filter is True
+
+
+def test_config_nested_override():
+    cfg = AppConfig.from_env(segment={"target_chars": 12.0})
+    assert cfg.segment.target_chars == 12.0
+    assert cfg.segment.max_chars == 17      # 其他字段保持默认
+
+
+def test_config_resolve_makes_dirs_absolute():
+    cfg = AppConfig.from_env().resolve()
+    assert Path(cfg.work_dir).is_absolute()
+    assert Path(cfg.lyrics_dir).is_absolute()
+
+
+def test_all_config_field_references_exist():
+    """静态自检：pipeline/ui 里引用的 cfg.<section>.<field> 必须真实存在。
+
+    这类拼写错误在运行时才炸（曾导致歌曲识别分支 AttributeError），
+    用一条静态测试把它挡在提交前。
+    """
+    import re
+    from dataclasses import fields as dc_fields
+
+    from core.config import (AsrConfig, ProviderConfig, SegmentConfig,
+                             SongConfig, TimingConfig, VoiceprintConfig)
+
+    sections = {
+        "segment": SegmentConfig, "asr": AsrConfig, "timing": TimingConfig,
+        "song": SongConfig, "voiceprint": VoiceprintConfig,
+        "provider": ProviderConfig,
+    }
+    app_dir = ROOT / "app"
+    bad = []
+    pattern = re.compile(r"\.(segment|asr|timing|song|voiceprint|provider)\.(\w+)")
+    for src in list(app_dir.glob("*.py")) + list(app_dir.glob("core/*.py")):
+        text = src.read_text(encoding="utf-8", errors="replace")
+        for section, attr in pattern.findall(text):
+            valid = {f.name for f in dc_fields(sections[section])}
+            if attr not in valid:
+                bad.append(f"{src.name}: {section}.{attr}")
+    assert not bad, "未知配置字段：" + ", ".join(bad)
+
+
+# ---------------- 外部接口 ----------------
+
+def test_external_response_parsing():
+    from core.providers.http_provider import parse_external_response
+
+    data = {"segments": [
+        {"start": 1.0, "end": 2.0, "text": "你好",
+         "words": [{"text": "你", "start": 1.0, "end": 1.5},
+                   {"text": "好", "start": 1.5, "end": 2.0}]},
+        {"start": 3.0, "end": 4.0, "text": "再见"},   # 无词级
+    ]}
+    segs = parse_external_response(data)
+    assert len(segs) == 2
+    assert segs[0].words[0].text == "你"
+    assert len(segs[1].words) == 2          # 自动按字均分
+
+
+def test_external_response_rejects_unknown_shape():
+    from core.providers.http_provider import parse_external_response
+    from core.providers import AsrError
+
+    with pytest.raises(AsrError):
+        parse_external_response({"unexpected": 1})
+
+
+# ---------------- 歌词/歌曲工具 ----------------
+
+def test_lrc_rows_parses_timestamps():
+    from core.song import lrc_rows
+
+    rows = lrc_rows("[00:12.34]第一行\n[00:15.00]第二行\n[ti:标题]\n")
+    assert len(rows) == 2
+    assert rows[0][0] == pytest.approx(12.34)
+    assert rows[1][1] == "第二行"
+
+
+def test_plain_rows_drops_credits():
+    from core.song import plain_rows
+
+    text = "[00:00.00] 词 : 张三\n[00:01.00] 曲 : 李四\n[00:21.95]垂柳斜向茉莉雨\n"
+    assert plain_rows(text, synced=True) == ["垂柳斜向茉莉雨"]
+
+
+def test_layout_score_prefers_matching_order():
+    from core.song import layout_score
+
+    transcript = "甲乙丙丁戊己庚辛"
+    same = "甲乙丙丁\n戊己庚辛\n"
+    shuffled = "戊己庚辛\n甲乙丙丁\n"
+    assert layout_score(transcript, same) >= layout_score(transcript, shuffled)
+
+
+# ---------------- 歌词多源链 ----------------
+
+def test_lyric_providers_registry():
+    from core.song import (DEFAULT_PROVIDER_ORDER, PROVIDERS,
+                           available_lyric_providers)
+
+    names = available_lyric_providers()
+    # 内置国内音源必须可用（需求：测试阶段涵盖国内音源）
+    assert "netease" in names
+    assert "kugou" in names
+    for name in DEFAULT_PROVIDER_ORDER:
+        assert name in PROVIDERS
+
+
+def test_custom_lyric_endpoint_registration():
+    from core.song import (PROVIDERS, CustomLyricProvider,
+                           set_custom_endpoint)
+
+    set_custom_endpoint("http://127.0.0.1:1/lyrics", "key")
+    assert isinstance(PROVIDERS["custom"], CustomLyricProvider)
+    # 无有效端点时检索应安全返回空（不抛异常）
+    assert PROVIDERS["custom"].search(title="x") == []
+
+
+def test_search_lyrics_skips_unregistered_provider():
+    from core.song import search_lyrics
+
+    logs = []
+    rows = search_lyrics(title="不存在", providers=["not_a_provider"],
+                         on_log=logs.append)
+    assert rows == []
+    assert any("未注册" in m for m in logs)
+
+
+def test_artist_mismatch_detection():
+    from core.song import _artist_mismatch
+
+    assert _artist_mismatch("周杰伦", "Xai小爱") is True
+    assert _artist_mismatch("周杰伦", "周杰伦") is False
+    assert _artist_mismatch("周杰伦", "周杰伦、费玉清") is False
+    # 空值不判为不匹配（避免误降权）
+    assert _artist_mismatch("", "某人") is False
+    assert _artist_mismatch("某人", "") is False
+
+
+# ---------------- BGM 多因子判别 ----------------
+
+def test_music_presence_rises_with_bass_and_flatness():
+    from core.bgm import SegmentFeatures, music_presence
+
+    clean = SegmentFeatures(start=0, end=3, bass_ratio=0.05,
+                            high_ratio=0.03, flatness=0.03,
+                            side_ratio=0.05)
+    with_music = SegmentFeatures(start=0, end=3, bass_ratio=0.35,
+                                 high_ratio=0.20, flatness=0.35,
+                                 side_ratio=0.35)
+    assert music_presence(clean) < music_presence(with_music)
+    assert 0.0 <= music_presence(clean) <= 1.0
+    assert 0.0 <= music_presence(with_music) <= 1.0
+
+
+def test_bgm_decide_keeps_streamer_rejects_backing_vocal():
+    """声纹高的现场段保留；声纹低 + 伴奏明显的段剔除。"""
+    from core.bgm import BgmTuning, SegmentFeatures, decide
+
+    cfg = BgmTuning()
+    live = SegmentFeatures(start=0, end=3, bass_ratio=0.08, high_ratio=0.04,
+                           flatness=0.05, side_ratio=0.08, loud_cv=0.6)
+    bgm = SegmentFeatures(start=0, end=3, bass_ratio=0.32, high_ratio=0.18,
+                          flatness=0.32, side_ratio=0.30, loud_cv=0.4)
+    assert decide(live, 0.78, cfg).keep is True
+    assert decide(bgm, 0.28, cfg).keep is False
+
+
+def test_bgm_decide_marks_reasons():
+    from core.bgm import BgmTuning, SegmentFeatures, decide
+
+    feat = SegmentFeatures(start=0, end=3, bass_ratio=0.32, flatness=0.35,
+                           side_ratio=0.4)
+    dec = decide(feat, 0.25, BgmTuning())
+    assert dec.reasons, "被剔除的段必须给出可复核的原因"
+    assert dec.vocal_sim == pytest.approx(0.25)
+
+
+def test_split_windows_covers_segments():
+    """子窗切分必须完整覆盖原段（不能漏掉音频内容）。"""
+    from core.pipeline2 import _split_windows
+
+    segs = [(0.0, 12.0), (20.0, 22.5)]
+    wins = _split_windows(segs, window=5.0, min_window=1.0)
+    for s, e in segs:
+        covered = sum(min(e, we) - max(s, ws) for ws, we in wins
+                      if we > s and ws < e)
+        assert covered == pytest.approx(e - s, abs=0.01)
+
+
+def test_merge_windows_bridges_small_gaps():
+    from core.pipeline2 import _merge_windows
+
+    wins = [(0.0, 5.0), (5.2, 10.0), (12.0, 15.0)]
+    merged = _merge_windows(wins, [True, True, True], gap=0.35)
+    assert merged == [(0.0, 10.0), (12.0, 15.0)]
+
+
+def test_merge_windows_drops_kept_false():
+    from core.pipeline2 import _merge_windows
+
+    wins = [(0.0, 5.0), (5.0, 10.0)]
+    assert _merge_windows(wins, [True, False], gap=0.35) == [(0.0, 5.0)]
+    assert _merge_windows(wins, [False, False], gap=0.35) == []
+
+
+# ---------------- 声纹（单目标） ----------------
+
+def test_streamer_profile_refs():
+    import numpy as np
+
+    from core.streamer import StreamerProfile
+
+    v = np.ones(4, dtype=np.float32) / 2
+    p = StreamerProfile(name="主播", speak=v)
+    assert len(p.refs()) == 1
+    p2 = StreamerProfile(name="主播", speak=v, sing=v)
+    assert [lab for lab, _ in p2.refs()] == ["speak", "sing"]
+    assert p.empty is False
+    assert StreamerProfile(name="x").empty is True
+
+
+def test_streamer_config_thresholds():
+    from core.streamer import StreamerConfig
+
+    cfg = StreamerConfig()
+    # 唱歌阈值必须低于说话阈值（同一人唱歌音色漂移更大）
+    assert cfg.sing_threshold < cfg.speak_threshold
+
+
+def test_classify_marks_non_streamer_when_below_threshold(monkeypatch):
+    """相似度低于阈值的段应被判为「非主播」。"""
+    import numpy as np
+
+    import core.streamer as st
+
+    # 用替身绕开真实音频读取与模型加载
+    monkeypatch.setattr(st, "_load_span",
+                        lambda _p, s, e: np.zeros(int((e - s) * 16000),
+                                                  dtype=np.float32))
+    monkeypatch.setattr(st.VoiceprintEngine, "embed_wavs",
+                        lambda self, wavs: np.tile(
+                            np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                            (len(wavs), 1)))
+    prof = st.StreamerProfile(name="主播", speak=np.array(
+        [0.0, 1.0, 0.0, 0.0], dtype=np.float32))
+    res = st.classify(st.VoiceprintEngine("cpu"), "unused.wav", [(0.0, 3.0)],
+                      prof, st.StreamerConfig(vote_ratio=0.5))
+    assert isinstance(res[0], st.SegmentMatch)
+    assert res[0].is_streamer is False
+
+
+def test_classify_accepts_matching_streamer(monkeypatch):
+    """相似度高于阈值的段应被判为「主播」。"""
+    import numpy as np
+
+    import core.streamer as st
+
+    monkeypatch.setattr(st, "_load_span",
+                        lambda _p, s, e: np.zeros(int((e - s) * 16000),
+                                                  dtype=np.float32))
+    monkeypatch.setattr(st.VoiceprintEngine, "embed_wavs",
+                        lambda self, wavs: np.tile(
+                            np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32),
+                            (len(wavs), 1)))
+    prof = st.StreamerProfile(name="主播", speak=np.array(
+        [0.0, 1.0, 0.0, 0.0], dtype=np.float32))
+    res = st.classify(st.VoiceprintEngine("cpu"), "unused.wav", [(0.0, 3.0)],
+                      prof, st.StreamerConfig(vote_ratio=0.5, adaptive=False))
+    assert res[0].is_streamer is True
+
+
+# ---------------- 歌曲强制对齐工具 ----------------
+
+def test_lines_from_alignment_splits_by_lyric_length():
+    from core.song import lines_from_alignment
+
+    chars = [(i * 0.1, (i + 1) * 0.1, c) for i, c in enumerate("abcd")]
+    lines = lines_from_alignment(chars, ["ab", "cd"])
+    assert [ln.text for ln in lines] == ["ab", "cd"]
+    assert lines[0].start == pytest.approx(0.0)
+
+
+def test_lines_from_alignment_truncates_when_short():
+    from core.song import lines_from_alignment
+
+    chars = [(0.0, 0.1, "a")]
+    lines = lines_from_alignment(chars, ["ab", "cd"])
+    assert len(lines) == 1
+
+
+def test_score_similarity_identical_is_one():
+    from core.song import score_similarity
+
+    assert score_similarity("雨下整夜", "雨下整夜") == 1.0
+    assert score_similarity("雨下整夜", "完全不同") < 0.3
+
+
+# ---------------- 流水线收尾（时间轴合法性） ----------------
+
+def test_finalize_removes_zero_duration_and_overlap():
+    """退化输入（零时长词、临界重叠）经收尾后必须时长>0 且单调不重叠。"""
+    from core.config import AppConfig
+    from core.pipeline2 import Pipeline, PipelineRequest
+
+    lines = [
+        SubtitleLine(words=[SubtitleWord("甲", 1.0, 1.05)]),
+        SubtitleLine(words=[SubtitleWord("乙", 1.05, 1.05)]),   # 零时长
+        SubtitleLine(words=[SubtitleWord("丙", 1.05, 1.10)]),
+        SubtitleLine(words=[SubtitleWord("丁", 1.08, 2.0)]),    # 重叠
+    ]
+    pipe = Pipeline(AppConfig.from_env(), PipelineRequest(input_path="x"))
+    pipe._finalize(lines)
+    assert all(ln.end > ln.start for ln in lines)
+    for a, b in zip(lines, lines[1:]):
+        assert a.end <= b.start + 1e-9
+
+
+def test_finalize_dedupes_repeated_sentence():
+    """短间隔重复的同一句应被去重（whisper 在歌声/回声上的常见现象）。"""
+    from core.config import AppConfig
+    from core.pipeline2 import Pipeline, PipelineRequest
+
+    lines = [
+        SubtitleLine(words=[SubtitleWord("晚上好晚上好", 1.0, 2.0)]),
+        SubtitleLine(words=[SubtitleWord("晚上好晚上好", 2.5, 3.5)]),  # 重复
+        SubtitleLine(words=[SubtitleWord("晚上好晚上好", 300.0, 301.0)]),  # 远处副歌保留
+    ]
+    pipe = Pipeline(AppConfig.from_env(), PipelineRequest(input_path="x"))
+    pipe._finalize(lines)
+    assert len(lines) == 2
+    assert lines[-1].start == 300.0

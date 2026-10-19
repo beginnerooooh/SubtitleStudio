@@ -1,0 +1,71 @@
+# ---------------- 运行时与依赖（体积大、平台相关，不入库） ----------------
+runtime/
+bin/
+models/
+desktop/node_modules/
+desktop/dist/
+*.exe
+*.dll
+*.pyd
+*.so
+*.dylib
+
+# ---------------- 本地生成数据（含用户内容，禁止上传） ----------------
+# 用户素材与样本：可能包含真实音视频 / 人工校对字幕
+Sample/
+samples/
+# 生成产物：每次运行的字幕、音频、报告
+outputs/
+projects/
+profiles/
+lyrics/
+cache/
+logs/
+temp/
+tmp/
+
+# ---------------- Python ----------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# ---------------- 编辑器 / 系统 ----------------
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------------- 本地工具与临时 ----------------
+.codebuddy/
+.workbuddy/
+.dsh-acl-recovery/
+staging/
+patches/
+optimize/
+*.log
+*.tmp
+*.bak
+*.orig
+
+# ---------------- 私有配置（可能含密钥 / 本地路径） ----------------
+.env
+.env.*
+!.env.example
+config.local.*
+*.local.json

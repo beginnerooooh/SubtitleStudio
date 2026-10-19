@@ -1,0 +1,30 @@
+# Subtitle Studio 运行依赖
+#
+# 安装：pip install -r requirements.txt
+#
+# 说明：
+# - torch 请按自己的 CUDA 版本安装（见 https://pytorch.org/get-started/locally/）。
+#   无 GPU 时安装 CPU 版本即可，程序会自动降级。
+# - 版本为该项目的验证组合；较新版本通常也可用。
+
+# ---- 识别引擎 ----
+faster-whisper>=1.1.0
+ctranslate2>=4.4.0
+funasr>=1.1.0
+
+# ---- 声纹与人声分离 ----
+speechbrain>=1.0.0
+demucs>=4.0.0
+
+# ---- 音频处理 ----
+numpy>=1.26
+soundfile>=0.12
+torch>=2.2
+torchaudio>=2.2
+
+# ---- 界面 ----
+gradio>=4.0
+
+# ---- 工具 ----
+requests>=2.31
+zhconv>=1.4
