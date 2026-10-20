@@ -340,15 +340,29 @@ def _subtitle_rows(lines: Iterable) -> list[tuple[int, str, float, float]]:
 
 def match_document(sub_lines: Iterable, doc: LyricDoc, *,
                    threshold: float = DEFAULT_MATCH_THRESHOLD,
-                   window: int = 8) -> MatchReport:
-    """把字幕与一首歌词做「顺序感知」的匹配。
+                   window: int = 8,
+                   min_run: int = 2) -> MatchReport:
+    """用歌词去匹配**一段连续的相似字幕**（局部匹配，不看全片平均）。
 
-    做法：对每条字幕行，在歌词中**允许有限跳跃**地寻找最相似的一行
-    （`window` 控制向前搜索的行数）。这比全局相似度更稳——歌词与字幕的
-    行数通常不一致（识别会多切或少切），但**顺序**是一致的。
+    为什么不能用「全片平均」（实测踩坑）
+    ──────────────────────────────────
+    一首歌通常只占全片的几分钟。若把相似度按全片行数平均，
+    一首 5 行的歌混在 200 行闲聊里，得分会被稀释到 0.006 量级，
+    远低于任何合理阈值 → **整首歌被否决**，用户看到的现象就是
+    「歌词库匹配效果不行」。
 
-    返回的 `score` 是匹配行相似度的加权平均，乘以覆盖率修正，
-    用于判断「这首歌词是否适用」。
+    正确做法（用户提出的思路）：拿歌词当模板，在字幕里滑动寻找
+    **一段连续命中**的区域，只在该区域内评估相似度。这样「局部匹配
+    得好」就能被识别出来，与全片长度无关。
+
+    实现
+    ────
+    1. 顺序扫描字幕，为每行找最相似的歌词行（允许有限跳跃）；
+    2. 把连续命中（未被中断）的片段收集为「匹配段」（run）；
+    3. 取**得分最高的那个段**作为结果——它的平均相似度与命中行数
+       共同决定整体分数。
+
+    返回的 `score` 只反映最佳段的质量，因此阈值可以稳定地设在 0.6~0.8。
     """
     rows = _subtitle_rows(sub_lines)
     if not rows or not doc.lines:
@@ -359,47 +373,61 @@ def match_document(sub_lines: Iterable, doc: LyricDoc, *,
     if not lyric:
         return MatchReport(doc=doc, reason="歌词缺少有效文本")
 
-    matches: list[LineMatch] = []
-    cursor = 0                     # 当前歌词位置（保证顺序）
-    hit_scores: list[float] = []
-
+    # 1) 逐行找最佳匹配（保留未命中的行，用于切断连续段）
+    hits: list[Optional[LineMatch]] = []
+    cursor = 0
     for idx, ntext, start, end in rows:
         best = (0.0, -1)
         lo = max(0, cursor - 1)
         hi = min(len(lyric), cursor + window)
         for j in range(lo, hi):
             lj, ltext = lyric[j]
-            # 长度差过大时直接跳过，省算力也减少误配
+            # 长度差过大时跳过：省算力，也避免把长短句错配
             if abs(len(ltext) - len(ntext)) > max(6, len(ntext)):
                 continue
             s = score_similarity(ntext, ltext)
             if s > best[0]:
                 best = (s, j)
         if best[1] >= 0 and best[0] >= threshold:
-            j = best[1]
-            lj, ltext = lyric[j]
-            orig = doc.lines[lj].text
-            matches.append(LineMatch(
+            lj, ltext = lyric[best[1]]
+            hits.append(LineMatch(
                 line_index=idx, lyric_index=lj, score=best[0],
-                subtitle_text=str(ntext), lyric_text=orig,
+                subtitle_text=str(ntext), lyric_text=doc.lines[lj].text,
                 start=start, end=end))
-            hit_scores.append(best[0])
-            cursor = j + 1
+            cursor = best[1] + 1
         else:
-            hit_scores.append(0.0)
+            hits.append(None)
 
-    if not matches:
-        return MatchReport(doc=doc, score=0.0,
-                           considered=len(rows),
+    # 2) 切分连续命中段
+    runs: list[list[LineMatch]] = []
+    cur: list[LineMatch] = []
+    for h in hits:
+        if h is not None:
+            cur.append(h)
+        elif cur:
+            runs.append(cur)
+            cur = []
+    if cur:
+        runs.append(cur)
+
+    # 3) 取最佳段（要求至少 min_run 行，避免单行巧合）
+    valid = [r for r in runs if len(r) >= min_run] or runs
+    if not valid:
+        return MatchReport(doc=doc, score=0.0, considered=len(rows),
                            reason="没有达到阈值的匹配行")
 
-    avg = sum(hit_scores) / len(hit_scores)
-    coverage = len(matches) / max(1, len(rows))
-    # 覆盖率太低说明可能只是零星巧合（如副歌重复）
-    overall = avg * (0.5 + 0.5 * coverage)
-    return MatchReport(doc=doc, score=round(overall, 4), matches=matches,
-                       considered=len(rows),
-                       reason=f"匹配 {len(matches)}/{len(rows)} 行")
+    best_run = max(valid, key=lambda r: (sum(m.score for m in r) / len(r)
+                                         * min(1.0, len(r) / 3.0)))
+    avg = sum(m.score for m in best_run) / len(best_run)
+    # 段越长越可信（3 行以上给满分权重），但**不按全片比例**稀释
+    length_weight = min(1.0, len(best_run) / 3.0)
+    overall = avg * (0.7 + 0.3 * length_weight)
+
+    return MatchReport(
+        doc=doc, score=round(overall, 4), matches=best_run,
+        considered=len(rows),
+        reason=(f"在 {len(rows)} 行中找到连续 {len(best_run)} 行匹配"
+                f"（平均相似度 {avg:.2f}）"))
 
 
 def apply_report(lines: list, report: MatchReport, *,

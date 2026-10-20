@@ -940,16 +940,35 @@ class Pipeline:
 
     def _post_correct(self, lines: list[SubtitleLine],
                       ctx: "Context") -> tuple[list[SubtitleLine], dict]:
-        """生成后文本校正：歌词库 + 弹幕旁路。
+        """生成后文本校正：自定义关键词 + 弹幕旁路 + 歌词库。
 
-        两步都是「可选且可关闭」的：任一失败只记录警告，绝不中断主流程
+        三步都是「可选且可关闭」的：任一失败只记录警告，绝不中断主流程
         （用户已经等了几分钟，不该因为校正模块的问题丢掉识别结果）。
+
+        顺序有意为之：**关键词最先**（用户明确声明的正确写法，最可靠），
+        其次弹幕（同期证据，能纠正专名），最后歌词（整句替换）。
+        反过来做会让歌词替换后的文本再被前面的步骤改动，难以复现。
         """
         from .danmaku_correct import correct_with_log
         from .lyrics_library import (LyricLibrary, apply_report, best_document)
 
         out = lines
         detail: dict = {}
+
+        # ---- 0) 用户自定义关键词字库 ----
+        try:
+            from core.keywords import KeywordStore, correct_with_keywords
+
+            store = KeywordStore(self.cfg.keywords_dir)
+            if store.size:
+                out, changes = correct_with_keywords(out, store)
+                detail["keywords"] = {"applied": len(changes),
+                                      "changes": changes[:50]}
+                if changes:
+                    self._log(f"关键词校正：替换 {len(changes)} 处")
+        except Exception as exc:  # noqa: BLE001
+            self.warnings.append(f"关键词校正失败：{exc}")
+            detail["keywords"] = {"applied": 0, "reason": str(exc)}
 
         # ---- 1) 弹幕/礼物/SC 专名校正 ----
         vp = self.cfg.voiceprint
@@ -1163,10 +1182,40 @@ class Pipeline:
         return fd.name
 
     def _hotword_prompt(self, ctx: "Context") -> str:
-        if ctx.live is None:
-            return self.cfg.asr.hotwords
-        words = ctx.live.hotwords(top=40)
-        return " ".join(words) if words else self.cfg.asr.hotwords
+        """构造识别提示词：**用户自定义字库 > 弹幕热词 > 配置项**。
+
+        自定义字库排最前，因为它是用户明确声明的正确写法（主播昵称、
+        术语），比从弹幕统计出来的候选更可靠。让模型一开始就倾向这些
+        写法，比任何后处理都根本。
+        """
+        parts: list[str] = []
+        # 1) 用户自定义关键词
+        try:
+            from core.keywords import KeywordStore
+
+            store = KeywordStore(self.cfg.keywords_dir)
+            kw = store.prompt_words(limit=60)
+            if kw:
+                parts.extend(kw)
+                self._log(f"已载入自定义关键词 {len(kw)} 个，用于识别提示")
+        except Exception:
+            pass
+        # 2) 弹幕热词（昵称/礼物名等）
+        if ctx.live is not None:
+            try:
+                live_words = ctx.live.hotwords(top=40)
+                # 去重：自定义词已覆盖的不重复
+                for w in live_words:
+                    if w not in parts:
+                        parts.append(w)
+            except Exception:
+                pass
+        # 3) 配置里的固定热词
+        fixed = (self.cfg.asr.hotwords or "").split()
+        for w in fixed:
+            if w not in parts:
+                parts.append(w)
+        return " ".join(parts)
 
     def _load_live_log(self, ctx: "Context") -> None:
         from core.livexml import load_log

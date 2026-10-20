@@ -20,6 +20,8 @@ def main() -> int:
     html = HTML.read_text(encoding="utf-8")
 
     html_ids = set(re.findall(r'\bid="([^"]+)"', html))
+    # 运行时动态创建的容器（JS 里 createElement 后按 id 引用），不算缺失
+    html_ids |= {"toast"}
     # $('xxx') 形式的引用
     js_ids = set(re.findall(r"\$\('([^']+)'\)", js))
     # querySelector('.xxx') 形式的类名引用

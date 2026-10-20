@@ -1,4 +1,4 @@
-﻿"""集中配置：算法阈值、模型选择、外部接口开关。
+"""集中配置：算法阈值、模型选择、外部接口开关。
 
 设计目标（针对评审报告的 R1/R2/G21）：
 - 所有此前散落在各模块的魔数集中在此，可按语料标定；
@@ -219,6 +219,8 @@ class AppConfig:
     work_dir: str = "outputs"
     profiles_dir: str = "profiles"
     lyrics_dir: str = "lyrics"
+    # 用户自定义关键词字库（主播昵称 / 术语 / 口头禅，提升专名识别）
+    keywords_dir: str = "keywords"
     models_dir: str = "models"
     # 可再生成的中间产物（抽取音频、歌曲切片、缩略图）放这里，便于整体清理
     cache_dir: str = "cache"
@@ -238,6 +240,7 @@ class AppConfig:
             work_dir=_env_str("SUBTITLE_STUDIO_WORK_DIR", "outputs"),
             profiles_dir=_env_str("SUBTITLE_STUDIO_PROFILES_DIR", "profiles"),
             lyrics_dir=_env_str("SUBTITLE_STUDIO_LYRICS_DIR", "lyrics"),
+            keywords_dir=_env_str("SUBTITLE_STUDIO_KEYWORDS_DIR", "keywords"),
             models_dir=_env_str("SUBTITLE_STUDIO_MODELS_DIR", "models"),
             device=_env_str("SUBTITLE_STUDIO_DEVICE", "auto"),
             asr=AsrConfig(
@@ -273,6 +276,7 @@ class AppConfig:
         root = Path(__file__).resolve().parent.parent.parent
         cfg = replace(self)
         for name in ("work_dir", "profiles_dir", "lyrics_dir", "models_dir",
+                     "keywords_dir",
                      "cache_dir"):
             p = Path(getattr(self, name))
             setattr(cfg, name, str(p if p.is_absolute() else root / p))

@@ -184,13 +184,19 @@ class ProjectStore:
             self._upsert_index(state.meta)
             self._last_save[state.meta.id] = time.time()
 
-    def autosave(self, state: ProjectState) -> bool:
-        """防抖自动保存（返回是否真的写了盘）。"""
+    def autosave(self, state: ProjectState, *, force: bool = False) -> bool:
+        """自动保存（返回是否真的写了盘）。
+
+        `force=True` 跳过防抖：**生成完成后必须立即落盘**，否则用户关掉
+        应用再打开就要重跑几小时的任务（实测反馈）。防抖只适合「边编辑
+        边自动保存」的场景，不能用在关键节点。
+        """
         pid = state.meta.id
         now = time.time()
-        with self._lock:
-            if now - self._last_save.get(pid, 0.0) < AUTOSAVE_DEBOUNCE:
-                return False
+        if not force:
+            with self._lock:
+                if now - self._last_save.get(pid, 0.0) < AUTOSAVE_DEBOUNCE:
+                    return False
         self.save(state, push_history=False, note="autosave")
         d = self.project_dir(pid)
         (d / "autosave.json").write_text(

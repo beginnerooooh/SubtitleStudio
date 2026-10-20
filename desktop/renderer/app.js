@@ -765,10 +765,32 @@ async function applyResult(result) {
       `${result.live.danmaku} 条 / 礼物 ${result.live.gifts}`;
   }
   drawTimeline();
-  await ensureProject();
-  await saveNow('generate');
+
+  // 自动保存（含历史快照），失败也要明确告知——不能静默丢失几小时的处理结果。
+  // 用 save 接口（立即落盘）而不是 autosave：后者有 1.5s 防抖，
+  // 生成刚结束时调用会被跳过，用户关掉应用就得重跑。
+  let saved = false;
+  try {
+    const p = await ensureProject();
+    const d = await apiJson(`/api/projects/${p.id}/save`, 'POST',
+      { lines: S.lines, settings: settingsPayload(), songs: S.songs,
+        bgm_flags: S.bgmFlags, note: 'generate' });
+    updateHistory(d);
+    S.dirty = false;
+    saved = true;
+    setSaveState('已自动保存', 'ok');
+  } catch (e) {
+    setSaveState('保存失败，请手动导出', 'warn');
+    toast(`结果已生成，但自动保存失败：${e.message}。请立即用「导出」保存。`,
+          'error', 12000);
+  }
+
+  // 进度条必须显式置满：只改文字会让进度条停在最后一帧的百分比，
+  // 看起来像「一直没完成」（实测反馈的显示 Bug）。
+  $('progress-bar').style.width = '100%';
   const bgmCount = S.bgmFlags.length;
-  $('progress-text').textContent = `完成：${S.lines.length} 行`
+  $('progress-text').textContent = (saved ? '完成并已保存' : '完成（未保存）')
+    + `：${S.lines.length} 行`
     + (bgmCount ? ` · ${bgmCount} 处疑似 BGM 待复核` : '');
 }
 
@@ -984,7 +1006,10 @@ async function editOp(op, body) {
   updateOverlay();
   if (d.clipboard) S.clipboard = d.clipboard;
   await markDirty();
-  $('progress-text').textContent = d.message || '';
+  // 编辑提示不写进「处理进度」那一栏：它会覆盖「完成并已保存」这类
+  // 终态文字，让用户以为任务没结束（实测反馈的显示 Bug）。
+  // 编辑反馈走 toast，进度栏只反映生成任务的状态。
+  if (d.message) toast(d.message, 'info', 1800);
   return d;
 }
 
@@ -1027,14 +1052,14 @@ async function doInsert() {
 async function doQc() {
   const d = await editOp('qc', { max_chars: 18 });
   await saveNow('qc');
-  $('progress-text').textContent = d.message;
+  toast(d.message || '质检完成', 'info', 3000);
 }
 
 async function doCopy() {
   const idx = [...S.selection];
   if (!idx.length) { toast('请先选中要复制的行。', 'warn'); return; }
   const d = await editOp('copy', { indices: idx });
-  $('progress-text').textContent = d.message;
+  toast(d.message || '已复制', 'info', 1800);
 }
 
 async function doPaste() {
@@ -1380,8 +1405,7 @@ async function doExport() {
   try {
     const d = await apiJson(`/api/projects/${S.project.id}/export`, 'POST', body);
     $('modal-export').classList.add('hidden');
-    $('progress-text').textContent =
-      `已导出 ${d.files.length} 个文件到 ${d.out_dir}`;
+    toast(`已导出 ${d.files.length} 个文件到 ${d.out_dir}`, 'ok', 6000);
     if (window.desktop && d.files.length) window.desktop.reveal(d.files[0]);
   } catch (e) {
     toast('导出失败：' + e.message, 'error');
@@ -1696,6 +1720,163 @@ async function pasteLyric() {
   } catch (e) {
     $('ly-status').textContent = '导入失败：' + e.message;
   }
+}
+
+// ---------------- 关键词字库 ----------------
+
+async function refreshKeywordCount() {
+  try {
+    const d = await apiJson('/api/keywords', 'GET', undefined, { silent: true });
+    $('kw-count').textContent = `${d.size} 个`;
+  } catch (e) { /* 忽略 */ }
+}
+
+async function addKeyword() {
+  const word = ($('kw-word').value || '').trim();
+  if (!word) { toast('请先填写关键词', 'warn'); return; }
+  const alias = ($('kw-alias').value || '')
+    .split(/[,，、]/).map((s) => s.trim()).filter(Boolean);
+  try {
+    const d = await apiJson('/api/keywords/add', 'POST', { word, alias });
+    $('kw-word').value = '';
+    $('kw-alias').value = '';
+    $('kw-count').textContent = `${d.size} 个`;
+    toast(`已添加「${word}」`, 'ok', 2000);
+  } catch (e) {
+    toast('添加失败：' + e.message, 'error');
+  }
+}
+
+async function openKeywordManager() {
+  $('modal-keywords').classList.remove('hidden');
+  await refreshKeywordList();
+}
+
+async function refreshKeywordList() {
+  try {
+    const d = await apiJson('/api/keywords', 'GET', undefined, { silent: true });
+    $('kw-list-count').textContent = `（${d.size} 个）`;
+    $('kw-count').textContent = `${d.size} 个`;
+    const box = $('kw-list');
+    if (!d.items.length) {
+      box.innerHTML = '<p class="muted small">字库为空。用上方文本框导入。</p>';
+      return;
+    }
+    box.innerHTML = d.items.map((k) => `
+      <div class="vp-item" data-word="${escapeHtml(k.word)}">
+        <span class="name">${escapeHtml(k.word)}</span>
+        <span class="tags">${k.alias && k.alias.length
+          ? '误写：' + escapeHtml(k.alias.join('、')) : ''}
+          ${k.category ? ' · ' + escapeHtml(k.category) : ''}</span>
+        <button class="btn sm act-del">删除</button>
+      </div>`).join('');
+    box.querySelectorAll('.vp-item').forEach((item) => {
+      const w = item.dataset.word;
+      item.querySelector('.act-del').onclick = async () => {
+        await apiJson('/api/keywords/remove', 'POST', { word: w });
+        await refreshKeywordList();
+      };
+    });
+  } catch (e) {
+    $('kw-list').innerHTML =
+      `<p class="muted small">读取失败：${escapeHtml(e.message)}</p>`;
+  }
+}
+
+async function importKeywords() {
+  const text = $('kw-text').value || '';
+  if (!text.trim()) { $('kw-status').textContent = '请先粘贴内容'; return; }
+  try {
+    const d = await apiJson('/api/keywords/bulk', 'POST', { text });
+    $('kw-status').textContent = `已导入 ${d.added} 个（共 ${d.size} 个）`;
+    await refreshKeywordList();
+  } catch (e) {
+    $('kw-status').textContent = '导入失败：' + e.message;
+  }
+}
+
+// ---------------- 字幕样式：应用到选中 / 全部 ----------------
+
+/** 把当前全局样式写到选中行（或全部行）。 */
+async function applyStyleTo(target) {
+  if (!S.lines.length) { toast('还没有字幕行', 'warn'); return; }
+  const body = { style: { ...S.style } };
+  if (target === 'all') {
+    await editOp('apply_style_all', body);
+    S.selection.clear();
+  } else {
+    const idx = [...S.selection];
+    if (!idx.length) { toast('请先选中要应用样式的行', 'warn'); return; }
+    body.indices = idx;
+    await editOp('set_style', body);
+  }
+  await saveNow('style');
+  renderList();
+  renderClips();
+  updateOverlay();
+}
+
+async function clearLineStyles() {
+  await editOp('apply_style_all', { style: {} });
+  await saveNow('style-clear');
+  renderList();
+  renderClips();
+  updateOverlay();
+  toast('已清除行级样式，全部跟随全局', 'ok', 2500);
+}
+
+// ---------------- 压制带字幕的视频 ----------------
+
+function openBurnDialog() {
+  if (!S.project || !S.project.meta.video) {
+    toast('请先打开视频', 'warn');
+    return;
+  }
+  if (!S.lines.length) { toast('还没有字幕可压制', 'warn'); return; }
+  $('burn-name').value = (S.project.meta.name || 'subtitle') + '_sub';
+  $('burn-dir').value = '';
+  $('burn-info').textContent =
+    `将压制 ${S.lines.length} 行；样式：${S.style.size}px `
+    + `${S.style.color} 描边${S.style.outline} 位置${S.style.anchor}`;
+  $('modal-burn').classList.remove('hidden');
+}
+
+async function startBurn() {
+  $('modal-burn').classList.add('hidden');
+  const body = {
+    style: { ...S.style },
+    name: ($('burn-name').value || 'subtitle').trim(),
+  };
+  const dir = ($('burn-dir').value || '').trim();
+  if (dir) body.out_dir = dir;
+  await runBlocking('正在压制字幕视频', '烧录样式与预览一致…', async () => {
+    const d = await apiJson(`/api/projects/${S.project.id}/burn`, 'POST', body,
+                            { silent: true });
+    const jid = d.job;
+    // 轮询进度
+    const t0 = Date.now();
+    while (Date.now() - t0 < 3 * 60 * 60 * 1000) {
+      await new Promise((r) => setTimeout(r, 1500));
+      let j;
+      try {
+        j = await apiJson(`/api/jobs/${jid}`, 'GET', undefined, { silent: true });
+      } catch (e) { continue; }
+      busyProgress(Number.isFinite(j.ratio) ? j.ratio : null,
+                   j.message || '压制中…');
+      if (j.status === 'done') {
+        busyProgress(1, '压制完成');
+        const f = (j.result && j.result.file) || d.out;
+        toast(`已压制：${f}`, 'ok', 8000);
+        if (window.desktop) window.desktop.reveal(f);
+        return;
+      }
+      if (j.status === 'error') {
+        toast('压制失败：' + (j.error || '未知原因'), 'error', 10000);
+        return;
+      }
+    }
+    toast('压制超时，请到导出目录查看', 'warn', 8000);
+  });
 }
 
 // ---------------- 面板分隔条（可拉伸，但不影响视频预览） ----------------
@@ -2283,6 +2464,36 @@ function bindEvents() {
   $('ly-fetch').onclick = fetchLyric;
   $('ly-import').onclick = importLyricFile;
   $('ly-paste').onclick = pasteLyric;
+
+  // 关键词字库
+  $('kw-add').onclick = addKeyword;
+  $('kw-bulk').onclick = openKeywordManager;
+  $('kw-manage').onclick = openKeywordManager;
+  $('kw-close').onclick = () => $('modal-keywords').classList.add('hidden');
+  $('kw-import').onclick = importKeywords;
+  $('kw-clear-all').onclick = async () => {
+    if (!(await askConfirm('清空全部关键词？'))) return;
+    await apiJson('/api/keywords/clear', 'POST', {});
+    await refreshKeywordList();
+  };
+  $('kw-word').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); addKeyword(); }
+  });
+
+  // 字幕样式：应用到选中 / 全部
+  $('st-apply-all').onclick = () => applyStyleTo('all');
+  $('st-apply-sel').onclick = () => applyStyleTo('selection');
+  $('st-clear').onclick = clearLineStyles;
+
+  // 压制视频
+  $('btn-burn').onclick = openBurnDialog;
+  $('burn-cancel').onclick = () => $('modal-burn').classList.add('hidden');
+  $('burn-ok').onclick = startBurn;
+  $('burn-browse').onclick = async () => {
+    if (!window.desktop) { toast('浏览器模式下请直接输入绝对路径', 'warn'); return; }
+    const dir = await window.desktop.chooseDir();
+    if (dir) $('burn-dir').value = dir;
+  };
   // 拖入音频文件
   for (const kind of ['speak', 'sing']) {
     const drop = $(kind === 'speak' ? 'vp-speak-drop' : 'vp-sing-drop');

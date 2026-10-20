@@ -42,7 +42,9 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -113,6 +115,8 @@ def lines_to_payload(lines: list[SubtitleLine]) -> list[dict]:
     return [{"start": round(ln.start, 3), "end": round(ln.end, 3),
              "text": ln.text, "speaker": ln.speaker,
              "low_confidence": ln.low_confidence,
+             # 行级样式覆盖（空 dict 表示跟随全局样式）
+             "style": dict(getattr(ln, "style", {}) or {}),
              "words": [{"text": w.text, "start": round(w.start, 3),
                         "end": round(w.end, 3)} for w in ln.words]}
             for ln in lines]
@@ -132,7 +136,8 @@ def payload_to_lines(rows: list[dict]) -> list[SubtitleLine]:
         if words:
             out.append(SubtitleLine(
                 words=words, speaker=row.get("speaker", ""),
-                low_confidence=bool(row.get("low_confidence"))))
+                low_confidence=bool(row.get("low_confidence")),
+                style=dict(row.get("style") or {})))
     return out
 
 
@@ -763,6 +768,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"ok": True,
                                     "providers": songmod.available_lyric_providers(),
                                     "order": list(songmod.DEFAULT_PROVIDER_ORDER)})
+        if path == "/api/keywords":
+            return self._keywords_list()
         if path == "/api/lyrics/library":
             return self._library_list()
         if path == "/api/lyrics/match":
@@ -882,6 +889,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/lyrics/library/remove":
             return self._library_remove(body)
 
+        if path == "/api/keywords/add":
+            return self._keywords_add(body)
+        if path == "/api/keywords/bulk":
+            return self._keywords_bulk(body)
+        if path == "/api/keywords/remove":
+            return self._keywords_remove(body)
+        if path == "/api/keywords/clear":
+            return self._keywords_clear(body)
+
         if path == "/api/profiles/delete":
             from core.streamer import delete_profile
 
@@ -944,8 +960,11 @@ class Handler(BaseHTTPRequestHandler):
             if "lines" in body:
                 state.lines = body["lines"]
             state.meta.line_count = len(state.lines)
-            wrote = STORE.autosave(state)
-            return self._send_json({"ok": True, "wrote": wrote})
+            # force：生成完成后必须立即落盘，跳过防抖
+            # （否则用户关掉应用再打开要重跑几小时任务）
+            wrote = STORE.autosave(state, force=bool(body.get("force")))
+            return self._send_json({"ok": True, "wrote": wrote,
+                                    "line_count": state.meta.line_count})
         if action == "undo":
             state = STORE.undo(pid)
             if state is None:
@@ -963,10 +982,139 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"ok": True, "meta": meta.__dict__})
         if action == "export":
             return self._export(pid, body)
+        if action == "burn":
+            # 压制带字幕的视频：长任务，走异步 job
+            return self._burn_video(pid, body)
         if action == "recover":
             lines = STORE.recover_autosave(pid)
             return self._send_json({"ok": True, "lines": lines})
         return self._send_error_json(f"未知操作：{action}", 404)
+
+    def _burn_video(self, pid: str, body: dict) -> None:
+        """把字幕压制进视频（硬字幕，样式与预览一致）。
+
+        实现要点：
+        - 先按当前样式生成 ASS（含行级覆盖），再用 ffmpeg 的 `subtitles`
+          滤镜烧录。选 ASS 而不是 drawtext 的原因：ASS 支持逐字卡拉OK、
+          描边、背景框、对齐与自由定位，与预览的样式模型一一对应。
+        - **样式一致性**靠 `to_ass(style=...)`：前端传的 size/color/outline/
+          anchor/bg 会被翻译成 ASS 的 Style 行（注意颜色是 BGR 顺序）。
+        - 输出到用户指定目录；无 ffmpeg 时明确报错。
+        - 走异步 job：压制长视频要几分钟，不能让 HTTP 请求挂着。
+        """
+        from core.env import detect_env
+        from core.subtitle import to_ass
+
+        state = STORE.load(pid)
+        lines = payload_to_lines(state.lines)
+        if not lines:
+            return self._send_json({"ok": False, "error": "没有字幕可压制"}, 400)
+
+        src = (body.get("input") or state.meta.video or "").strip()
+        if not src:
+            return self._send_json({"ok": False, "error": "项目没有关联视频"}, 400)
+        src_path = Path(src)
+        if not src_path.is_absolute():
+            src_path = (ROOT / src_path).resolve()
+        if not src_path.is_file():
+            return self._send_json(
+                {"ok": False, "error": f"视频不存在：{src_path}"}, 400)
+
+        env = detect_env()
+        if not env.ffmpeg_available:
+            return self._send_json(
+                {"ok": False, "error": "未找到 FFmpeg，无法压制视频"}, 503)
+
+        style = dict(body.get("style") or {})
+        out_dir = (body.get("out_dir") or "").strip()
+        if out_dir:
+            out = Path(out_dir)
+            if not out.is_absolute():
+                return self._send_json(
+                    {"ok": False, "error": "out_dir 必须是绝对路径"}, 400)
+        else:
+            out = STORE.project_dir(pid) / "exports"
+        try:
+            out.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            return self._send_json(
+                {"ok": False, "error": f"无法创建目录：{exc}"}, 400)
+
+        name = (body.get("name") or state.meta.name or "subtitle").strip()
+        dst = out / f"{name}_sub.mp4"
+
+        # 先把 ASS 写到项目目录（作为压制输入，也便于用户检查样式）
+        ass_path = STORE.project_dir(pid) / "burn.ass"
+        ass_path.write_text(
+            to_ass(lines, style=style, mark_low_confidence=False),
+            encoding="utf-8")
+
+        job_id = uuid.uuid4().hex[:12]
+        job: dict[str, Any] = {
+            "id": job_id, "status": "running", "ratio": 0.0,
+            "message": "准备压制…", "log": [], "result": None, "error": "",
+            "started": time.time(), "cancel": threading.Event(),
+        }
+        with JOBS_LOCK:
+            JOBS[job_id] = job
+
+        def run() -> None:
+            import subprocess
+            try:
+                # 路径含空格/冒号会让 subtitles 滤镜解析失败（实测报
+                # 「Unable to parse "original_size" option value」）。
+                # 转义规则很脆弱，因此改为：把 ASS 放到一个临时工作目录，
+                # 用**纯 ASCII 文件名**（无空格无冒号），并让 ffmpeg 以该
+                # 目录为 cwd —— 滤镜里只写相对文件名，彻底避开转义问题。
+                work = Path(tempfile.mkdtemp(prefix="burn_"))
+                safe_ass = work / "sub.ass"
+                shutil.copyfile(ass_path, safe_ass)
+                filt = "subtitles=sub.ass"
+                enc = _pick_encoder(env.ffmpeg_path or "ffmpeg")
+                cmd = [env.ffmpeg_path or "ffmpeg", "-y", "-v", "error",
+                       *_pick_hwaccel(env.ffmpeg_path or "ffmpeg"),
+                       "-i", str(src_path), "-vf", filt, *enc,
+                       "-c:a", "copy", str(dst)]
+                job["message"] = "正在压制字幕…"
+                proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.PIPE, cwd=str(work))
+                while proc.poll() is None:
+                    if job["cancel"].is_set():
+                        proc.kill()
+                        job["status"] = "error"
+                        job["error"] = "已取消"
+                        return
+                    # 无精确进度：用已耗时估算（长视频压制通常 1~3 倍速）
+                    elapsed = time.time() - job["started"]
+                    try:
+                        dur = float(state.meta.duration or 0)
+                    except Exception:
+                        dur = 0.0
+                    if dur > 0:
+                        job["ratio"] = min(0.99, elapsed / max(dur, 1) * 0.5)
+                    time.sleep(1.0)
+                if proc.returncode == 0 and dst.is_file() and dst.stat().st_size > 0:
+                    job["result"] = {"file": str(dst),
+                                     "size_mb": round(dst.stat().st_size / 1048576, 1)}
+                    job["status"] = "done"
+                    job["ratio"] = 1.0
+                    job["message"] = "压制完成"
+                else:
+                    err = (proc.stderr.read() or b"").decode("utf-8", "replace")
+                    job["status"] = "error"
+                    job["error"] = err[-400:] or "压制失败"
+            except Exception as exc:  # noqa: BLE001
+                job["status"] = "error"
+                job["error"] = f"{type(exc).__name__}: {exc}"
+            finally:
+                try:
+                    shutil.rmtree(work, ignore_errors=True)
+                except Exception:
+                    pass
+
+        threading.Thread(target=run, daemon=True).start()
+        return self._send_json({"ok": True, "job": job_id, "ass": str(ass_path),
+                                "out": str(dst)})
 
     def _export(self, pid: str, body: dict) -> None:
         """导出字幕。
@@ -1067,6 +1215,23 @@ class Handler(BaseHTTPRequestHandler):
                 index=int(idx) if idx not in (None, "") else None)
         elif op == "duplicate":
             lines, msg = ed.duplicate_lines(lines, body.get("indices") or [])
+        elif op == "set_style":
+            # 给选中行设置样式覆盖（style 为空 dict 表示清除覆盖）
+            idx = body.get("indices") or []
+            style = dict(body.get("style") or {})
+            n = 0
+            for i in idx:
+                if 0 <= int(i) < len(lines):
+                    lines[int(i)].style = dict(style)
+                    n += 1
+            msg = f"已为 {n} 行设置样式" if n else "请先选中要设置样式的行"
+        elif op == "apply_style_all":
+            # 把样式应用到**所有**字幕（含清除：style 为空时清空全部覆盖）
+            style = dict(body.get("style") or {})
+            for ln in lines:
+                ln.style = dict(style)
+            msg = (f"已把样式应用到全部 {len(lines)} 行" if style
+                   else f"已清除全部 {len(lines)} 行的样式覆盖")
         elif op == "qc":
             lines, m1 = ed.fix_overlaps(lines)
             lines, m2 = ed.split_long_lines(
@@ -1205,6 +1370,51 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"ok": False, "error": "需要 title"}, 400)
         ok = lib.remove(title, artist)
         return self._send_json({"ok": ok, "size": lib.size})
+
+    # ---------- 关键词字库 ----------
+
+    def _keyword_store(self):
+        from core.keywords import KeywordStore
+
+        return KeywordStore(ROOT / "keywords")
+
+    def _keywords_list(self) -> None:
+        st = self._keyword_store()
+        return self._send_json({
+            "ok": True, "size": st.size,
+            "items": [k.to_dict() for k in st.list_items()],
+            "prompt": st.prompt_text(),
+        })
+
+    def _keywords_add(self, body: dict) -> None:
+        st = self._keyword_store()
+        word = (body.get("word") or "").strip()
+        alias = body.get("alias") or []
+        if isinstance(alias, str):
+            alias = [a.strip() for a in alias.split(",") if a.strip()]
+        try:
+            k = st.add(word, alias=alias,
+                       note=(body.get("note") or "").strip(),
+                       category=(body.get("category") or "").strip())
+        except Exception as exc:  # noqa: BLE001
+            return self._send_json({"ok": False, "error": str(exc)}, 400)
+        return self._send_json({"ok": True, "word": k.word, "size": st.size})
+
+    def _keywords_bulk(self, body: dict) -> None:
+        st = self._keyword_store()
+        added = st.add_many(body.get("text") or "",
+                            category=(body.get("category") or "").strip())
+        return self._send_json({"ok": True, "added": added, "size": st.size})
+
+    def _keywords_remove(self, body: dict) -> None:
+        st = self._keyword_store()
+        ok = st.remove((body.get("word") or "").strip())
+        return self._send_json({"ok": ok, "size": st.size})
+
+    def _keywords_clear(self, body: dict) -> None:
+        st = self._keyword_store()
+        n = st.clear()
+        return self._send_json({"ok": True, "removed": n, "size": st.size})
 
     # ---------- 歌词库 ----------
 

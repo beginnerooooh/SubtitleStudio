@@ -19,6 +19,8 @@ outputs/
 projects/
 profiles/
 lyrics/
+# 用户自定义关键词字库（可能含真实主播名/术语，属运行时数据）
+keywords/
 cache/
 logs/
 temp/
@@ -64,6 +66,8 @@ optimize/
 *.orig
 
 # ---------------- 私有配置（可能含密钥 / 本地路径） ----------------
+# 本地敏感词表：含真实主播名/房间号，绝不入库
+tools/sensitive.txt
 .env
 .env.*
 !.env.example

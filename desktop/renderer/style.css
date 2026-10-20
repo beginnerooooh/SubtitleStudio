@@ -43,9 +43,13 @@ body {
   display: flex; align-items: center; gap: 6px; padding: 0 10px;
   height: var(--h-toolbar); flex: 0 0 var(--h-toolbar);
   background: var(--panel); border-bottom: 1px solid var(--line);
+  /* 允许收缩而不是溢出：溢出会让最右侧的「草稿箱/保存状态」被裁掉 */
+  min-width: 0; overflow: hidden;
 }
-.brand { font-weight: 700; font-size: 13px; color: var(--accent); margin-right: 6px; }
-.tool-group { display: flex; gap: 4px; align-items: center; }
+.brand { font-weight: 700; font-size: 13px; color: var(--accent); margin-right: 6px;
+         letter-spacing: .02em; white-space: nowrap; flex: 0 0 auto; }
+.tool-group { display: flex; gap: 4px; align-items: center;
+              flex: 0 1 auto; min-width: 0; }
 .spacer { flex: 1 1 auto; min-width: 0; }
 
 .btn {
@@ -65,6 +69,31 @@ body {
 .btn.icon.on { background: var(--panel-3); border-color: var(--accent); color: var(--accent); }
 .btn.sm { padding: 2px 8px; font-size: 11px; }
 .save-state { font-size: 11px; color: var(--muted); min-width: 66px; text-align: right; }
+
+/* 工具栏里的紧凑控件（识别参数上移后使用） */
+.tb-select {
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 3px 6px; font-size: 11px; font-family: inherit;
+  max-width: 132px;
+}
+.tb-field {
+  display: flex; align-items: center; gap: 3px;
+  background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 2px 6px; font-size: 11px;
+  color: var(--muted);
+}
+.tb-field input {
+  width: 46px; background: transparent; border: none; color: var(--text);
+  font-size: 11px; font-family: inherit; padding: 1px 0;
+}
+.tb-field input:focus { outline: none; }
+/* 窄视口下才隐藏工具栏里的识别参数。
+ * 断点取 1180：常规窗口（实测约 1397 CSS px）应完整显示，
+ * 只有真正挤不下时才收起——否则「上移到工具栏」就失去意义。 */
+@media (max-width: 1180px) {
+  .toolbar .tb-select, .toolbar .tb-field { display: none; }
+}
 
 /* ---------------- 主编辑区 ---------------- */
 /* editor 用 flex:1 占据「工具栏与日志抽屉之间」的全部剩余高度，

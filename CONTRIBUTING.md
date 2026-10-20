@@ -27,7 +27,16 @@
    ```bash
    python -m pytest tests/ -q
    python tools/check_desktop_ids.py
+   python tools/desensitize.py      # 数据脱敏（推送前必跑）
    ```
+
+   > **数据脱敏是强制步骤。** 本项目在真实直播素材上开发，工作区里很容易
+   > 残留真实主播名、房间号、本地绝对路径、样本文件名。这些一旦提交就进了
+   > git 历史，很难彻底清除。因此仓库带了 `pre-push` 钩子，发现敏感信息会
+   > **直接拒绝推送**。
+   >
+   > 把你自己的敏感词写进 `tools/sensitive.txt`（每行一个，该文件已加入
+   > `.gitignore`，不会入库）。
 
 3. 提交信息建议用「类型: 简述」：
 

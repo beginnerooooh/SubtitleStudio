@@ -873,6 +873,191 @@ def test_non_blocking_toast_replaces_alert():
         "仍有阻塞式 confirm 调用"
 
 
+# ---------------- 歌词库：局部匹配（用户核心反馈） ----------------
+
+def test_lyric_match_is_local_not_global_average():
+    """回归：歌词匹配必须按「局部连续段」评分，不能按全片平均。
+
+    这是「歌词库匹配效果不行」的根因：一首 5 行的歌混在 200 行闲聊里，
+    若按全片平均，得分被稀释到 0.006 量级 → 整首歌被否决。
+    """
+    from core.lyrics_library import match_document, parse_lyric_text
+
+    doc = parse_lyric_text(
+        "倘若这世间\n一切都在无情的崩裂\n我会用手中的线为你缝原",
+        title="测试曲")
+    # 200 行闲聊 + 3 行歌词（模拟真实直播：歌只占几分钟）
+    rows = ["今天天气不错我们来聊聊天吧"] * 197
+    rows += ["倘若这世界", "一切都在无尽的崩裂", "我会用手中的线为你奉约"]
+    subs = [_line(t, i * 2.0, i * 2.0 + 1.8) for i, t in enumerate(rows)]
+
+    rep = match_document(subs, doc, threshold=0.55)
+    assert rep.score > 0.7, (
+        f"局部匹配应给出高分，实际 {rep.score}（若按全片平均会被稀释）")
+    assert len(rep.matches) == 3
+    # 命中的必须是最后三行（即歌词所在位置）
+    assert [m.line_index for m in rep.matches] == [197, 198, 199]
+
+
+def test_lyric_replaces_asr_errors_with_original_text():
+    """回归：高相似度的识别偏差应被歌词原文替换。"""
+    from core.lyrics_library import apply_report, match_document, parse_lyric_text
+
+    subs = [_line("倘若这世界", 0.0, 2.0),
+            _line("一切都在无尽的崩裂", 2.0, 4.0),
+            _line("我会用手中的线为你奉约", 4.0, 6.0)]
+    doc = parse_lyric_text(
+        "倘若这世间\n一切都在无情的崩裂\n我会用手中的线为你缝原",
+        title="x")
+    rep = match_document(subs, doc)
+    out, n = apply_report(subs, rep, min_score=0.75)
+    assert n == 3
+    assert out[0].text == "倘若这世间"
+    assert out[1].text == "一切都在无情的崩裂"
+    assert out[2].text == "我会用手中的线为你缝原"
+
+
+def test_lyric_rejects_unrelated_document_locally():
+    """回归：无关歌词在局部评分下仍应被拒绝（避免误替换）。"""
+    from core.lyrics_library import match_document, parse_lyric_text
+
+    subs = [_line("倘若这世界", 0.0, 2.0), _line("一切都在无尽的崩裂", 2.0, 4.0)]
+    doc = parse_lyric_text("完全不同的另一首歌的歌词内容在这里", title="y")
+    rep = match_document(subs, doc)
+    assert rep.score < 0.55, f"无关歌词不应得高分，实际 {rep.score}"
+
+
+# ---------------- 关键词字库 ----------------
+
+def test_keyword_store_add_and_alias(tmp_path):
+    from core.keywords import KeywordStore
+
+    st = KeywordStore(tmp_path / "keywords")
+    st.add("脆脆鲨", alias=["翠翠沙", "脆脆沙"], category="昵称")
+    st.add("舰长", category="术语")
+    assert st.size == 2
+    assert "脆脆鲨" in st.prompt_text()
+    # 别名映射应指向正确写法
+    assert st.match_map().get("翠翠沙") == "脆脆鲨"
+
+
+def test_keyword_store_bulk_import_and_comments(tmp_path):
+    from core.keywords import KeywordStore
+
+    st = KeywordStore(tmp_path / "keywords")
+    n = st.add_many("# 注释行\n脆脆鲨|翠翠沙\n\n舰长\n九宫格")
+    assert n == 3, f"应导入 3 个，实际 {n}"
+    assert st.size == 3
+
+
+def test_keyword_store_rejects_too_short(tmp_path):
+    from core.keywords import KeywordStore
+
+    st = KeywordStore(tmp_path / "keywords")
+    with pytest.raises(ValueError):
+        st.add("的")
+
+
+def test_keyword_correction_fixes_alias_in_sentence(tmp_path):
+    """回归：别名出现在句子中间时也应被替换。"""
+    from core.keywords import KeywordStore, correct_with_keywords
+
+    st = KeywordStore(tmp_path / "kw")
+    st.add("脆脆鲨", alias=["翠翠沙"])
+    subs = [_line("今天翠翠沙来啦", 0.0, 2.0), _line("完全无关的句子", 2.0, 4.0)]
+    out, changes = correct_with_keywords(subs, st)
+    assert len(changes) == 1
+    assert out[0].text == "今天脆脆鲨来啦"
+    assert out[1].text == "完全无关的句子"
+
+
+def test_keyword_correction_keeps_timeline(tmp_path):
+    from core.keywords import KeywordStore, correct_with_keywords
+
+    st = KeywordStore(tmp_path / "kw")
+    st.add("脆脆鲨", alias=["翠翠沙"])
+    subs = [_line("翠翠沙来了", 1.5, 3.5)]
+    out, _ = correct_with_keywords(subs, st)
+    assert out[0].start == pytest.approx(1.5)
+    assert out[0].end == pytest.approx(3.5)
+
+
+# ---------------- 行级样式 / 应用到所有字幕 ----------------
+
+def test_subtitle_line_supports_style_override():
+    from core.models import SubtitleLine, SubtitleWord
+
+    ln = SubtitleLine(words=[SubtitleWord(text="甲", start=0, end=1)])
+    assert ln.style == {}, "默认无行级覆盖"
+    ln.style = {"color": "#FF0000", "size": 90}
+    assert ln.style["size"] == 90
+
+
+def test_ass_color_is_bgr_order():
+    """回归：ASS 颜色是 BGR 顺序，直接套用 RGB 会让红蓝互换。"""
+    from core.subtitle import _ass_color
+
+    assert _ass_color("#FFFFFF") == "&H00FFFFFF"
+    assert _ass_color("#FF0000") == "&H000000FF", "红色应落在 B 通道位置"
+    assert _ass_color("#0000FF") == "&H00FF0000"
+
+
+def test_ass_style_reflects_preview_settings():
+    """回归：烧录样式必须与预览一致（字号/颜色/描边/对齐）。"""
+    from core.subtitle import to_ass
+
+    lines = [_line("测试字幕", 0.0, 2.0)]
+    ass = to_ass(lines, style={"size": 72, "color": "#FFD700",
+                              "outline": 5, "anchor": "middle", "bg": True})
+    style_line = next(ln for ln in ass.splitlines()
+                      if ln.startswith("Style: Default"))
+    assert ",72," in style_line, "字号应写入样式"
+    fields = style_line.split(",")
+    assert fields[3] == "&H0000D7FF", "颜色应为 BGR 转换结果"
+    # bg=True → BorderStyle=3（不透明背景框）；Alignment=5（居中）
+    assert fields[15] == "3" and fields[18] == "5"
+
+
+def test_ass_inline_override_for_single_line():
+    """回归：行级样式应通过内联标签覆盖全局样式。"""
+    from core.subtitle import to_ass
+
+    ln = _line("特殊行", 0.0, 2.0)
+    ln.style = {"color": "#FF0000", "size": 110}
+    ass = to_ass([ln], style={"size": 72, "color": "#FFFFFF"})
+    dialogue = next(x for x in ass.splitlines() if x.startswith("Dialogue:"))
+    assert "\\fs110" in dialogue, "行级字号应内联"
+    assert "\\c&H000000FF" in dialogue, "行级颜色应内联"
+
+
+# ---------------- 数据脱敏 ----------------
+
+def test_desensitize_script_detects_common_leaks(tmp_path):
+    """回归：脱敏脚本必须能识别常见敏感信息。"""
+    import subprocess
+
+    root = Path(__file__).resolve().parent.parent
+    script = root / "tools" / "desensitize.py"
+    assert script.is_file(), "缺少脱敏脚本"
+    src = script.read_text(encoding="utf-8")
+    for kw in ("Downloads", "gh[pousr]_", "Sample", "sensitive.txt"):
+        assert kw in src, f"脱敏规则缺少 {kw}"
+    proc = subprocess.run([sys.executable, str(script)],
+                          capture_output=True, timeout=180,
+                          # 脚本输出含中文，Windows 默认 GBK 会解码失败
+                          encoding="utf-8", errors="replace")
+    assert proc.returncode in (0, 1), "脚本应正常结束"
+
+
+def test_pre_push_hook_runs_desensitize():
+    """回归：pre-push 钩子应调用脱敏脚本（推送前强制检查）。"""
+    hook = Path(__file__).resolve().parent.parent / ".git" / "hooks" / "pre-push"
+    if not hook.is_file():
+        pytest.skip("无 pre-push 钩子（非 git 环境）")
+    text = hook.read_text(encoding="utf-8", errors="replace")
+    assert "desensitize.py" in text, "钩子必须运行脱敏检查"
+
+
 # ---------------- 弹幕 XML ----------------
 
 XML = """<?xml version="1.0" encoding="UTF-8"?>

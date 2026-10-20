@@ -136,6 +136,39 @@ WMV, RMVB** and similar formats, the backend transcodes to a `faststart` MP4 and
 - **Subtitle styling** — size / colour / outline / position (presets or free dragging)
 - **Convenience** — autosave, undo/redo, drafts, crash recovery, cache cleanup
 
+### Lyric Library & Keyword Correction
+
+**Lyric library** (lyrics/): import .lrc / .txt / .srt, or fetch online by title + artist.
+
+Matching scores the **best contiguous run** rather than the whole-file average —
+this is the key design decision:
+
+| Scenario | Whole-file average (old) | Local run (now) |
+|---|---|---|
+| 3 lyric lines alone | 0.836 OK | 0.836 OK |
+| 3 lyric lines among 200 chat lines | **0.006 rejected** | **0.836 matched** |
+
+A song typically occupies only a few minutes of a recording. Averaging across the
+whole file dilutes the score below any sensible threshold and rejects the song
+entirely — the root cause behind "lyric matching does not work". The matcher now
+slides over the subtitles looking for a **contiguous run of hits** and scores only
+that region.
+
+**Keyword store** (keywords/): streamer nicknames, jargon, catchphrases.
+
+- Used as recognition hints (initial_prompt) so the model gets names right from the start
+- A post-pass then corrects output: alias replacement via correct|wrong1,wrong2,
+  plus fuzzy whole-line correction
+- Text only — the timeline is never touched
+
+### Subtitle Styling & Video Burn-in
+
+- **Style scope** — global by default; a single line can override it, or use
+  "apply to all subtitles" to bake the current style into every line
+- **Burn-in** — render subtitles into the picture (hard subs) with styling identical
+  to the preview (size / colour / outline / position), via an ASS filter, preferring
+  hardware encoding
+
 ### Evaluation
 
 Compare generated output against a human-proofread reference:

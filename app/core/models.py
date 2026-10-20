@@ -21,6 +21,10 @@ class SubtitleLine:
     speaker: str = ""                 # 说话人名（多声纹模式后处理填充）
     low_confidence: bool = False      # 置信度标注：供人工复核
     low_confidence_reason: str = ""   # 标注原因（识别置信度低 / 说话人归属不确定）
+    # 行级样式覆盖（空表示跟随全局样式）。键与前端 S.style 一致：
+    # size / color / outline / anchor / x / y / bg
+    # 用于「只给某几行单独设置样式」，以及「应用到所有字幕」把全局样式固化到行上。
+    style: dict = field(default_factory=dict)
 
     @property
     def start(self) -> float:
