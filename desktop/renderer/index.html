@@ -99,6 +99,31 @@
       </details>
 
       <details open>
+        <summary>声纹注册（UVR5 分离）</summary>
+        <div class="sec-body">
+          <p class="muted small">
+            在时间轴上框选一段**主播单独说话或清唱**的区间，用 UVR5
+            分离出人声后注册声纹。分离能有效去掉 BGM 干扰，比直接
+            用原音频注册更准。</p>
+          <div class="kv"><span>UVR5</span>
+            <span id="uvr-status" class="muted">检测中…</span></div>
+          <div class="field"><label>名称</label>
+            <input id="uvr-name" placeholder="例如：主播说话" /></div>
+          <div class="kv"><span>选中区间</span>
+            <span id="uvr-span" class="muted">未选择</span></div>
+          <label class="check">
+            <input id="uvr-use" type="checkbox" checked /> 用 UVR5 分离人声（推荐）</label>
+          <div class="row-btns">
+            <button id="uvr-enroll" class="btn sm accent">注册声纹</button>
+            <button id="uvr-use-selection" class="btn sm">用当前框选</button>
+          </div>
+          <p class="muted small">
+            提示：在时间轴上按住左键拖动可框选区间（也可先选中字幕，
+            再点「用当前框选」取其时间范围）。</p>
+        </div>
+      </details>
+
+      <details open>
         <summary>字幕样式</summary>
         <div class="sec-body">
           <div class="preset-row">

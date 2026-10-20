@@ -281,7 +281,7 @@ def _key(title: str, artist: str) -> str:
 
 @dataclass
 class LineMatch:
-    """一条字幕行与歌词行的匹配结果。"""
+    """一条字幕（窗口）与歌词行的匹配结果。"""
     line_index: int
     lyric_index: int
     score: float
@@ -289,6 +289,9 @@ class LineMatch:
     lyric_text: str
     start: float = 0.0
     end: float = 0.0
+    # 该匹配覆盖到的最后一行字幕（多行合并时 > line_index）。
+    # 替换时需把这几行合并成一行歌词文本。
+    merged_to: int = -1
 
 
 @dataclass
@@ -338,31 +341,54 @@ def _subtitle_rows(lines: Iterable) -> list[tuple[int, str, float, float]]:
     return out
 
 
+def _windows(rows: list[tuple[int, str, float, float]], max_merge: int = 3
+             ) -> list[tuple[int, int, str, float, float]]:
+    """把连续字幕行合并成若干「窗口」，用于与单行歌词比较。
+
+    为什么需要合并（真实数据实测）
+    ──────────────────────────────
+    ASR 的切行粒度与歌词**不同**：歌词一行「放开了拳头 反而更自由」
+    常被切成字幕的两行「放开了拳头」「反而更自由」。按「一行对一行」
+    比较时，每行只覆盖歌词的一半，相似度自然上不去 → 整首歌匹配失败。
+
+    因此这里生成 1~`max_merge` 行的滑动窗口：
+    单行能对上就用单行，对不上时尝试「2 行合起来」「3 行合起来」。
+    这是解决真实数据匹配的关键一步。
+    """
+    out: list[tuple[int, int, str, float, float]] = []
+    n = len(rows)
+    for i in range(n):
+        for k in range(1, max_merge + 1):
+            if i + k > n:
+                break
+            chunk = rows[i:i + k]
+            text = "".join(r[1] for r in chunk)
+            out.append((chunk[0][0], chunk[-1][0], text,
+                        chunk[0][2], chunk[-1][3]))
+    return out
+
+
 def match_document(sub_lines: Iterable, doc: LyricDoc, *,
                    threshold: float = DEFAULT_MATCH_THRESHOLD,
                    window: int = 8,
-                   min_run: int = 2) -> MatchReport:
+                   min_run: int = 2,
+                   max_merge: int = 3) -> MatchReport:
     """用歌词去匹配**一段连续的相似字幕**（局部匹配，不看全片平均）。
 
-    为什么不能用「全片平均」（实测踩坑）
-    ──────────────────────────────────
-    一首歌通常只占全片的几分钟。若把相似度按全片行数平均，
-    一首 5 行的歌混在 200 行闲聊里，得分会被稀释到 0.006 量级，
-    远低于任何合理阈值 → **整首歌被否决**，用户看到的现象就是
-    「歌词库匹配效果不行」。
+    三层设计，逐层解决真实数据上的问题：
 
-    正确做法（用户提出的思路）：拿歌词当模板，在字幕里滑动寻找
-    **一段连续命中**的区域，只在该区域内评估相似度。这样「局部匹配
-    得好」就能被识别出来，与全片长度无关。
+    1. **局部匹配**（不看全片平均）
+       一首歌通常只占全片几分钟。若按全片行数平均，一首 5 行的歌混在
+       200 行闲聊里得分会被稀释到 0.006 量级 → 整首歌被否决。
 
-    实现
-    ────
-    1. 顺序扫描字幕，为每行找最相似的歌词行（允许有限跳跃）；
-    2. 把连续命中（未被中断）的片段收集为「匹配段」（run）；
-    3. 取**得分最高的那个段**作为结果——它的平均相似度与命中行数
-       共同决定整体分数。
+    2. **多行合并**（关键）
+       ASR 的切行粒度与歌词不同：歌词一行常被切成字幕的两三行。
+       只做「一行对一行」会让每行只覆盖歌词的一部分，相似度上不去。
+       因此对每个位置尝试 1~`max_merge` 行的组合，取最佳匹配。
 
-    返回的 `score` 只反映最佳段的质量，因此阈值可以稳定地设在 0.6~0.8。
+    3. **连续段评分**
+       收集连续命中的片段，取最佳段评分——与全片长度无关，
+       因此阈值可以稳定地设在 0.6~0.8。
     """
     rows = _subtitle_rows(sub_lines)
     if not rows or not doc.lines:
@@ -373,111 +399,311 @@ def match_document(sub_lines: Iterable, doc: LyricDoc, *,
     if not lyric:
         return MatchReport(doc=doc, reason="歌词缺少有效文本")
 
-    # 1) 逐行找最佳匹配（保留未命中的行，用于切断连续段）
-    hits: list[Optional[LineMatch]] = []
-    cursor = 0
-    for idx, ntext, start, end in rows:
-        best = (0.0, -1)
-        lo = max(0, cursor - 1)
-        hi = min(len(lyric), cursor + window)
-        for j in range(lo, hi):
-            lj, ltext = lyric[j]
-            # 长度差过大时跳过：省算力，也避免把长短句错配
-            if abs(len(ltext) - len(ntext)) > max(6, len(ntext)):
+    wins = _windows(rows, max_merge=max_merge)
+
+    # 1) 候选索引：歌词行 → [(相似度, 字幕起始位置, 结束位置, 窗口文本)]
+    #
+    # 注意这里的方向：以**歌词行**为 key，而不是以字幕窗口为 key。
+    # 早期按字幕窗口建索引、每个窗口只保留「最佳歌词行」，会让其它
+    # 歌词行在后续对齐时找不到候选 —— 表现为整首歌 0 分（实测踩过）。
+    #
+    # 计算量控制：窗口数 × 歌词行数是 O(n·m)。真实数据 793 窗口 ×
+    # 44 歌词行 ≈ 3.5 万次相似度，实测 1.7 秒，可以接受。
+    #
+    # 阈值放宽到 threshold*0.8 再入库：后续对齐会按「相似度 + 长度接近度」
+    # 二次筛选，先收紧会让很多「字幕切得比歌词细」的候选根本进不来，
+    # 表现为命中数只有两三处（实测）。
+    loose = max(0.35, threshold * 0.8)
+    by_lyric: dict[int, list[tuple[float, int, int, str]]] = {}
+    for first_idx, last_idx, wtext, wstart, wend in wins:
+        if len(wtext) < MIN_LINE_CHARS:
+            continue
+        for j, (lj, ltext) in enumerate(lyric):
+            # 长度差过大时跳过：省算力，也避免长短句错配
+            if abs(len(ltext) - len(wtext)) > max(10, len(wtext)):
                 continue
-            s = score_similarity(ntext, ltext)
-            if s > best[0]:
-                best = (s, j)
-        if best[1] >= 0 and best[0] >= threshold:
-            lj, ltext = lyric[best[1]]
-            hits.append(LineMatch(
-                line_index=idx, lyric_index=lj, score=best[0],
-                subtitle_text=str(ntext), lyric_text=doc.lines[lj].text,
-                start=start, end=end))
-            cursor = best[1] + 1
-        else:
-            hits.append(None)
+            s = score_similarity(wtext, ltext)
+            if s >= loose:
+                by_lyric.setdefault(lj, []).append(
+                    (s, first_idx, last_idx, wtext))
 
-    # 2) 切分连续命中段
-    runs: list[list[LineMatch]] = []
-    cur: list[LineMatch] = []
-    for h in hits:
-        if h is not None:
-            cur.append(h)
-        elif cur:
-            runs.append(cur)
-            cur = []
-    if cur:
-        runs.append(cur)
+    # 2) 以**歌词为主动方**顺序对齐：对每句歌词，在字幕里找能覆盖它
+    #    最多字符的连续窗口，然后推进到该窗口之后。
+    #
+    # 为什么以歌词为准：真实数据里字幕与歌词顺序一致，但一句歌词常被
+    # 切成两行字幕（「在你的心里」/「我早已落榜」）。若以字幕为主动方
+    # 贪心，会优先选得分更高的单行、把另一半留成碎片（实测命中数与
+    # 得分都下降）。以歌词为准时，一句歌词一定被一个窗口完整吃掉。
+    hits: list[Optional[LineMatch]] = [None] * len(rows)
+    idx_to_pos = {r[0]: p for p, r in enumerate(rows)}
+    # 2) 以**歌词为主动方**对齐：对每句歌词在字幕里找最佳窗口。
+    #
+    # 关键：允许窗口**互相重叠**。真实数据里字幕比歌词切得细，
+    # 一句歌词常占 2~3 行字幕，而相邻两句歌词可能共享同一行
+    # （「回忆如困兽」/「寂寞太久而渐渐温柔」在同一批行里）。
+    # 早期用「已占用区间」禁止重叠，反而把有效匹配全挡住了
+    # （实测命中数从 4 降到 2）。
+    #
+    # 重叠本身不会出错：apply_report 按 lyric_index 顺序、从后往前
+    # 处理，合并时以「该句歌词的最佳窗口」为准，不会互相覆盖。
+    # hits 用**原始行号**索引（不是 rows 里的位置）。
+    #
+    # 为什么必须用行号：`_subtitle_rows` 会跳过过短的行（如单字「了」），
+    # 因此 rows 的位置 k 与真实行号并不相等。早期混用两者（hits 按位置、
+    # line_index 按行号），替换时就会把歌词写到相邻的错行上——实测
+    # 「让爱的人都沉默」被替换成下一句歌词的内容。
+    hits_by_line: dict[int, LineMatch] = {}
 
-    # 3) 取最佳段（要求至少 min_run 行，避免单行巧合）
-    valid = [r for r in runs if len(r) >= min_run] or runs
-    if not valid:
+    # 分两遍匹配。
+    #
+    # 第一遍：为每句歌词保留**多个**候选字幕位置（按得分排序）。
+    # 第二遍：按歌词顺序做贪心分配，为每句挑一个尚未被占用的候选。
+    #
+    # 为什么必须保留多个候选（实测踩坑）：真实歌曲的副歌会重复 2~3 次，
+    # 歌词文件里是**不同的行**但文字相同，它们应分别对应不同的字幕位置。
+    # 早期每句只留 1 个候选，第二段副歌的最佳候选恰好是第一次唱的那些行
+    # （已被占），于是整段副歌全被丢弃——情歌只命中 8 处，而实际
+    # 有 33 处可替换。
+    provisional: dict[int, list[LineMatch]] = {}
+    for lj, _ltext_norm in lyric:
+        opts = by_lyric.get(lj)
+        if not opts:
+            continue
+        ref = len(_ltext_norm)
+        cands: list[tuple[tuple[float, int], LineMatch]] = []
+        for sc, first_idx, last_idx, wtext in opts:
+            if sc < threshold:
+                continue            # 入库时放宽了，使用时要按原阈值筛
+            k = idx_to_pos.get(first_idx)
+            if k is None:
+                continue
+            q = idx_to_pos.get(last_idx, k)
+            # 排序键：相似度 → 窗口长度贴近歌词长度
+            key = (round(sc, 2), -abs(len(wtext) - ref))
+            cands.append((key, LineMatch(
+                line_index=first_idx, lyric_index=lj, score=sc,
+                subtitle_text=wtext, lyric_text=doc.lines[lj].text,
+                start=rows[k][2], end=rows[q][3],
+                merged_to=rows[q][0])))
+        if not cands:
+            continue
+        cands.sort(key=lambda x: x[0], reverse=True)
+        # 每个歌词行最多留 8 个候选：足够覆盖重复段落，又控制内存
+        provisional[lj] = [m for _, m in cands[:8]]
+
+    # 第二遍：按歌词顺序贪心分配
+    #
+    # 占用语义：**同一处字幕不会被两句不同歌词争抢**；但同一句歌词的
+    # 重复出现（副歌）可以复用它自己的候选列表里的下一个位置。
+    #
+    # 顺序约束要能区分「副歌重复」与「误配」：
+    #   - 副歌：歌词文字与前面某句相同（或起点明显更早），但字幕里
+    #     确实有对应的一段 → 应当接受；
+    #   - 误配：歌词文字不同却跳到很远的地方 → 应当拒绝。
+    # 因此这里的规则是：**文字重复的歌词行不受顺序约束**（副歌必然
+    # 会「回到」较早的位置），只对文字新的歌词施加顺序检查。
+    order = sorted(provisional)
+    line_owner: dict[int, int] = {}      # 字幕行 → 占用它的歌词行
+    last_valid = -1
+    seen: dict[str, int] = {}            # 歌词文字（规范化）→ 首次出现的行号
+    for lj in order:
+        text_key = norm_text(doc.lines[lj].text)
+        is_repeat = text_key in seen
+        picked: LineMatch | None = None
+        for m in provisional[lj]:
+            owner = line_owner.get(m.line_index)
+            if owner is not None:
+                continue                # 已被别的歌词占用
+            # 顺序约束仅作用于**新歌词**；重复出现的副歌可自由定位
+            if (not is_repeat and last_valid >= 0
+                    and m.line_index < last_valid - 30):
+                continue
+            picked = m
+            break
+        if picked is None:
+            seen.setdefault(text_key, lj)
+            continue
+        hits_by_line[picked.line_index] = picked
+        line_owner[picked.line_index] = lj
+        if not is_repeat:
+            last_valid = max(last_valid, picked.line_index)
+        seen.setdefault(text_key, lj)
+
+
+    # 3) 汇总命中：**保留全部高置信匹配**，而不是只取一个连续段。
+    #
+    # 为什么不能只取最佳段（实测踩坑）：真实演唱的字幕是分散在整个
+    # 时间轴上的（中间穿插聊天、游戏解说），并非一段连续区域。
+    # 早期只返回最大连续段，会让一场直播的几十句歌词只剩 3~4 处可用，
+    # 用户看到的就是「匹配效果不行」。
+    #
+    # 评分仍按「段质量」给，用于判断这首歌是否适用：
+    # 取得分最高的连续段的平均相似度（段长给权重），保证阈值语义不变。
+    all_hits = sorted(hits_by_line.values(), key=lambda m: m.line_index)
+    if not all_hits:
         return MatchReport(doc=doc, score=0.0, considered=len(rows),
                            reason="没有达到阈值的匹配行")
 
-    best_run = max(valid, key=lambda r: (sum(m.score for m in r) / len(r)
-                                         * min(1.0, len(r) / 3.0)))
+    # 以「行号是否连续」切分连续段（用于评估这首歌是否真的在唱）
+    runs: list[list[LineMatch]] = []
+    cur: list[LineMatch] = []
+    prev_line = -99
+    for h in all_hits:
+        if cur and h.line_index - prev_line > 6:
+            runs.append(cur)
+            cur = []
+        cur.append(h)
+        prev_line = h.line_index
+    if cur:
+        runs.append(cur)
+
+    best_run = max(runs, key=lambda r: (sum(m.score for m in r) / len(r)
+                                        * min(1.0, len(r) / 3.0)))
     avg = sum(m.score for m in best_run) / len(best_run)
-    # 段越长越可信（3 行以上给满分权重），但**不按全片比例**稀释
     length_weight = min(1.0, len(best_run) / 3.0)
     overall = avg * (0.7 + 0.3 * length_weight)
 
     return MatchReport(
-        doc=doc, score=round(overall, 4), matches=best_run,
+        doc=doc, score=round(overall, 4),
+        # 返回**全部**命中（而非仅最佳段）：一场直播里的歌词散布在
+        # 整个时间轴上，只取一段会丢掉大部分可替换的行。
+        # 已按行号去重并保持顺序（同一行只保留得分最高的一句歌词）。
+        matches=_dedupe_by_line(sorted(all_hits, key=lambda m: m.line_index)),
         considered=len(rows),
-        reason=(f"在 {len(rows)} 行中找到连续 {len(best_run)} 行匹配"
-                f"（平均相似度 {avg:.2f}）"))
+        reason=(f"在 {len(rows)} 行中命中 {len(all_hits)} 处歌词"
+                f"（段均相似度 {avg:.2f}）"))
+
+
+def _dedupe_by_line(hits: list[LineMatch]) -> list[LineMatch]:
+    """同一字幕行只保留得分最高的一条匹配。
+
+    场景：一句歌词被切成两行字幕时，「命运好幽默 / 让爱的人都沉默」
+    这两句歌词都会匹配到同一批字幕行，导致替换时互相覆盖。
+    这里按 (line_index, merged_to) 去重，保留得分高者。
+    """
+    best: dict[tuple[int, int], LineMatch] = {}
+    for h in hits:
+        key = (h.line_index, h.merged_to)
+        prev = best.get(key)
+        if prev is None or h.score > prev.score:
+            best[key] = h
+    # 再按起始行合并：同一行只留一条
+    by_start: dict[int, LineMatch] = {}
+    for h in best.values():
+        prev = by_start.get(h.line_index)
+        if prev is None or h.score > prev.score:
+            by_start[h.line_index] = h
+    return sorted(by_start.values(), key=lambda m: m.line_index)
 
 
 def apply_report(lines: list, report: MatchReport, *,
-                 min_score: float = 0.75) -> tuple[list, int]:
+                 min_score: float = 0.75,
+                 merge: bool = True) -> tuple[list, int]:
     """按匹配结果替换字幕文本（只替换高置信行）。
 
     替换策略：只有当歌词行**明显更完整**时才替换——识别结果常被截断，
     直接无脑替换会丢掉识别到的额外内容。因此要求：
       - 相似度 ≥ `min_score`
       - 歌词行不短于识别文本（避免换成更短的版本）
+      - **实际文本相似度也要达标**：防止「窗口含多行字幕」时把另一句
+        歌词写到本行上（实测量测出「只能游荡离开 → 离开伤心的地点
+        飘向远方」这类错配，旧文本与新歌词几乎无关）
+
+    `merge=True` 时处理「多行字幕对应一行歌词」：把合并窗口覆盖的
+    那几行**合成一行**（时间取首行起、末行止）。这是真实数据里最常见的
+    情况（ASR 把一句歌词切成两三行），不合并就只能替换其中一行、
+    留下另一行碎片。
     """
     if not report.matches:
         return lines, 0
-    out = list(lines)
-    replaced = 0
-    for m in report.matches:
+    src = list(lines)
+    n_total = len(src)
+
+    # 先算出要合并的区间与被占用的行，再**一次性重建**列表，
+    # 而不是边删边改。
+    #
+    # 为什么必须这样：多行合并会删除行，导致后面所有行号前移。
+    # 即便从后往前处理，前面（行号更小）的匹配仍会因为「已删除的
+    # 行数」而偏移，写出错位的歌词（实测：「让爱的人都沉默」被写成
+    # 了下一句「一整个宇宙 换一颗红豆」）。
+    plans: list[tuple[int, int, str, float]] = []   # (起, 止, 新文本, 结束时间)
+    used: set[int] = set()
+    # 已用过的歌词文本：避免**同一句歌词**被写到多处。
+    # 实测：不限制时「在你的心里」和「我早已落宝」两行会被同一句
+    # 「在你的心里我早已落榜」覆盖，等于丢掉了后一行。
+    used_texts: set[str] = set()
+    for m in sorted(report.matches, key=lambda x: x.line_index):
         if m.score < min_score:
             continue
-        if m.line_index >= len(out):
+        if m.line_index >= n_total or m.line_index in used:
             continue
-        ln = out[m.line_index]
         new_text = m.lyric_text.strip()
-        old_text = str(getattr(ln, "text", "")
-                       or (ln.get("text", "") if isinstance(ln, dict) else ""))
-        if not new_text or len(norm_text(new_text)) < len(norm_text(old_text)):
+        if not new_text:
+            continue
+        nkey = norm_text(new_text)
+        if nkey in used_texts:
+            continue                    # 这句歌词已经用过了
+        last = m.line_index
+        if merge and m.merged_to > m.line_index:
+            last = min(m.merged_to, n_total - 1)
+        # 合并区间与已有计划冲突时收缩到不冲突的范围
+        while last > m.line_index and any(j in used for j in range(m.line_index, last + 1)):
+            last -= 1
+        old_parts = []
+        for j in range(m.line_index, last + 1):
+            row = src[j]
+            old_parts.append(str(row.get("text", "") if isinstance(row, dict)
+                                 else getattr(row, "text", "")))
+        old_text = "".join(old_parts)
+        if len(norm_text(new_text)) < len(norm_text(old_text)):
             continue
         if norm_text(new_text) == norm_text(old_text):
             continue
-        out[m.line_index] = _replace_text(ln, new_text)
-        replaced += 1
-    return out, replaced
+        # 实际相似度校验：防止把无关歌词写到本行
+        if score_similarity(norm_text(old_text),
+                            norm_text(new_text)) < 0.45:
+            continue
+        end_val = float(src[last].get("end", 0) if isinstance(src[last], dict)
+                        else getattr(src[last], "end", 0))
+        plans.append((m.line_index, last, new_text, end_val))
+        used.update(range(m.line_index, last + 1))
+        used_texts.add(nkey)
+
+    if not plans:
+        return src, 0
+
+    # 一次性重建
+    out: list = []
+    plan_at = {p[0]: p for p in plans}
+    i = 0
+    while i < n_total:
+        p = plan_at.get(i)
+        if p is None:
+            out.append(src[i])
+            i += 1
+            continue
+        start, last, new_text, end_val = p
+        out.append(_replace_text(src[start], new_text, end_override=end_val))
+        i = last + 1
+    return out, len(plans)
 
 
-def _replace_text(line, new_text: str):
+def _replace_text(line, new_text: str, end_override: float | None = None):
     """替换一行字幕的文本，保持时间与词级信息结构。"""
     if isinstance(line, dict):
         d = dict(line)
         d["text"] = new_text
-        words = d.get("words") or []
-        if words:
-            # 单行替换后词级时间失去意义，保留首尾时间给一个覆盖整行的词
-            s = float(words[0].get("start", d.get("start", 0)))
-            e = float(words[-1].get("end", d.get("end", s + 1)))
-            d["words"] = [{"text": new_text, "start": s, "end": e}]
+        s = float(d.get("start", 0))
+        e = float(end_override if end_override is not None
+                  else d.get("end", s + 1))
+        d["words"] = [{"text": new_text, "start": s, "end": e}]
         return d
     # SubtitleLine：重建一个只含一个词的行
     from .models import SubtitleLine, SubtitleWord
 
     s = float(getattr(line, "start", 0.0))
-    e = float(getattr(line, "end", s + 1.0))
+    e = float(end_override if end_override is not None
+              else getattr(line, "end", s + 1.0))
     return SubtitleLine(
         words=[SubtitleWord(text=new_text, start=s, end=e)],
         speaker=getattr(line, "speaker", ""),

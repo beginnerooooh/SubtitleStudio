@@ -141,6 +141,18 @@ def payload_to_lines(rows: list[dict]) -> list[SubtitleLine]:
     return out
 
 
+def _wav_seconds(path: str) -> float:
+    """读取 WAV 的时长（秒）；失败返回 0。"""
+    try:
+        import wave
+
+        with wave.open(path, "rb") as w:
+            sr = w.getframerate() or 1
+            return float(w.getnframes()) / float(sr)
+    except Exception:
+        return 0.0
+
+
 # ---------------- 后台生成任务 ----------------
 
 def start_job(cfg_kwargs: dict, req_kwargs: dict) -> str:
@@ -779,6 +791,8 @@ class Handler(BaseHTTPRequestHandler):
 
             return self._send_json({"ok": True,
                                     "profiles": list_profiles(ROOT / "profiles")})
+        if path == "/api/uvr/status":
+            return self._uvr_status()
         if path == "/api/cache/stats":
             stats = STORE.clean_cache(CACHE_DIR, dry_run=True)
             return self._send_json({"ok": True, **stats})
@@ -907,6 +921,12 @@ class Handler(BaseHTTPRequestHandler):
             removed = delete_profile(name, profiles_dir=str(ROOT / "profiles"))
             return self._send_json({"ok": True, "removed": removed})
 
+        if path == "/api/uvr/status":
+            return self._uvr_status()
+        if path == "/api/uvr/enroll":
+            return self._uvr_enroll(body)
+        if path == "/api/uvr/status":
+            return self._uvr_status()
         if path == "/api/profiles":
             from core.streamer import VoiceprintEngine, StreamerProfile, save_profile
 
@@ -926,6 +946,89 @@ class Handler(BaseHTTPRequestHandler):
             path_saved = save_profile(prof, profiles_dir=str(ROOT / "profiles"))
             return self._send_json({"ok": True, "path": str(path_saved)})
         return self._send_error_json("未知接口：" + path, 404)
+
+    # ---------- UVR5（人声分离 / 区间声纹注册） ----------
+
+    def _uvr_status(self) -> None:
+        """返回 UVR5 是否可用、有哪些模型。"""
+        from core import uvr5
+
+        st = uvr5.status()
+        return self._send_json({"ok": True, **st.to_dict()})
+
+    def _uvr_enroll(self, body: dict) -> None:
+        """从时间轴选中的区间做声纹注册。
+
+        流程（每一步都可能很慢，因此同步返回但前端带进度窗）：
+          1. FFmpeg 按时间切出该区间；
+          2. UVR5 的 MDX 模型分离出人声（去掉 BGM/伴奏）；
+          3. 重采样到 16kHz（声纹引擎要求）；
+          4. 提取声纹并保存为 profile。
+
+        `use_uvr=false` 时跳过第 2 步（直接用原音频），用于素材本来就干净的情况。
+        """
+        from core import uvr5
+        from core.env import detect_env
+        from core.streamer import VoiceprintEngine, StreamerProfile, save_profile
+
+        name = (body.get("name") or "").strip()
+        src = (body.get("input") or "").strip()
+        try:
+            start = float(body.get("start") or 0.0)
+            end = float(body.get("end") or 0.0)
+        except (TypeError, ValueError):
+            return self._send_json({"ok": False, "error": "时间参数无效"}, 400)
+        if not name:
+            return self._send_json({"ok": False, "error": "请填写声纹名称"}, 400)
+        if not src or not Path(src).is_file():
+            return self._send_json(
+                {"ok": False, "error": f"视频/音频不存在：{src}"}, 400)
+        if end <= start:
+            return self._send_json(
+                {"ok": False, "error": "区间无效：结束时间必须大于开始时间"}, 400)
+        if end - start < 2.0:
+            return self._send_json(
+                {"ok": False, "error": "区间太短（至少 2 秒）"}, 400)
+
+        use_uvr = bool(body.get("use_uvr", True))
+        device = body.get("device") or "cpu"
+        cache = CACHE_DIR / "voiceprint"
+        cache.mkdir(parents=True, exist_ok=True)
+        tag = _cache_key(src, start, end, use_uvr)
+        vocal = cache / f"vp_{tag}.wav"
+
+        try:
+            if use_uvr and uvr5.status().available:
+                uvr5.separate_segment_for_voiceprint(
+                    src, str(vocal), start, end)
+            else:
+                # 不分离：直接切段并重采样到 16k
+                ff = detect_env().ffmpeg_path or "ffmpeg"
+                import subprocess
+
+                subprocess.run(
+                    [ff, "-y", "-v", "error", "-ss", f"{start:.3f}",
+                     "-t", f"{end - start:.3f}", "-i", src,
+                     "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+                     str(vocal)],
+                    check=True, capture_output=True)
+            engine = VoiceprintEngine(device=device)
+            # enroll(wav, start, end) 的参数是**秒**（内部 _cap 会按文件
+            # 时长裁剪）。这里传 0 到实际时长即可，别传 1e9 ——
+            # _cap 会把它当成「秒」算出越界区间并抛「无效音频区间」。
+            dur = _wav_seconds(str(vocal))
+            vec = engine.enroll(str(vocal), 0.0, dur)
+            prof = StreamerProfile(name=name, speak=vec)
+            saved = save_profile(prof, profiles_dir=str(ROOT / "profiles"))
+        except Exception as exc:  # noqa: BLE001
+            return self._send_json(
+                {"ok": False, "error": f"{type(exc).__name__}: {exc}"}, 500)
+
+        return self._send_json({
+            "ok": True, "name": name, "path": str(saved),
+            "wav": str(vocal), "seconds": round(end - start, 2),
+            "uvr": use_uvr, "dim": int(len(vec)),
+        })
 
     def _route_delete(self) -> None:
         parsed = urlparse(self.path)

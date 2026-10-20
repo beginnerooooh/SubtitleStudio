@@ -154,6 +154,19 @@ entirely — the root cause behind "lyric matching does not work". The matcher n
 slides over the subtitles looking for a **contiguous run of hits** and scores only
 that region.
 
+**Three fixes found on real data** (1014 actual subtitle lines + two `.lrc` files):
+
+| Symptom | Root cause | Fix |
+|---|---|---|
+| both songs scored 0.000 | one lyric line is usually split across 2–3 subtitle lines, so a line-for-line comparison only covers half of it | merge up to 3 subtitle lines before comparing (`_windows`) |
+| only 8 hits for a song with 33 replaceable spots | the chorus repeats 2–3 times but each lyric line kept a single candidate, already consumed by the first pass | keep multiple candidates per line; lines whose text repeats are exempt from the ordering check |
+| lyrics written onto the neighbouring line | merging deleted lines while iterating, shifting earlier (lower-index) matches | compute all replacements first, then rebuild the list in one pass |
+
+An **actual-similarity guard** was added on top: a window may include
+neighbouring subtitles, so if the old text and the new lyric are genuinely
+dissimilar (< 0.45) the replacement is skipped. On the real data this produced
+**zero suspicious replacements**.
+
 **Keyword store** (keywords/): streamer nicknames, jargon, catchphrases.
 
 - Used as recognition hints (initial_prompt) so the model gets names right from the start
@@ -446,6 +459,33 @@ Conventions:
 - Before committing, make sure both `pytest` and `check_desktop_ids.py` pass
 
 ---
+
+## Vocal Separation & Voiceprint Enrollment (UVR5)
+
+When UVR5 (Ultimate Vocal Remover 5) is installed locally, its models can be
+reused for **segment-level vocal separation** before voiceprint enrollment:
+
+1. Drag-select a segment where the streamer talks or sings alone
+2. Click "enroll voiceprint" — the UVR5 MDX model extracts the vocal (removing BGM)
+3. Resample to 16 kHz → extract a 192-dim embedding → save
+
+Measured: a 20-second segment takes about 20 seconds end to end.
+
+**Why reimplement instead of calling UVR5 itself**: UVR5 ships as a PyInstaller
+single-file bundle driven only by a GUI — no CLI. Its downloaded models are plain
+ONNX weights, though, so they can be loaded directly. That also lets us separate
+*only the selected segment* rather than the whole file.
+
+**Implementation notes (all learned the hard way)**
+
+| Symptom | Root cause | Fix |
+|---|---|---|
+| Got invalid dimensions ... Expected: 3072 | assumed n_fft=2048 → 1025 bins | read the real shape from session.get_inputs() (3072 bins ⇒ n_fft 6144) |
+| near-silent output, spectral centroid at 13 kHz | applied an extra mask = |out|/|in| | MDX is spectrum-to-spectrum; its output *is* the vocal spectrum |
+| only the first/last few hundred ms audible | overlapping blocks assigned directly, uncovered frames stayed zero | accumulate magnitudes and average, reuse the original phase |
+| "must be 16000 Hz" from the voiceprint engine | MDX requires 44.1 kHz | resample to 16 kHz after separation |
+
+Without UVR5 it degrades gracefully to enrolling from the raw audio.
 
 ## Performance
 

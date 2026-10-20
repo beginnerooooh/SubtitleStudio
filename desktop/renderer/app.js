@@ -1795,6 +1795,86 @@ async function importKeywords() {
   }
 }
 
+// ---------------- 声纹注册（UVR5 分离） ----------------
+
+/** 查询 UVR5 可用性并显示在左栏。 */
+async function refreshUvrStatus() {
+  const el = $('uvr-status');
+  if (!el) return;
+  try {
+    const d = await apiJson('/api/uvr/status', 'GET', undefined, { silent: true });
+    if (d.available) {
+      el.textContent = `可用 · ${d.preferred || '有模型'}`;
+      el.style.color = 'var(--ok, #4ec97a)';
+    } else {
+      el.textContent = '不可用（将直接用原音频）';
+      el.style.color = 'var(--muted)';
+      el.title = d.reason || '';
+    }
+  } catch (e) {
+    el.textContent = '检测失败';
+  }
+}
+
+/** 把当前框选/选中的时间范围填到「选中区间」。 */
+function useSelectionAsSpan() {
+  // 优先用时间轴框选（S.marqueeRange），其次用选中字幕的时间范围
+  let range = S.marqueeRange;
+  let label = '框选';
+  if (!range && S.selection && S.selection.size) {
+    const idx = [...S.selection];
+    const rows = idx.map((i) => S.lines[i]).filter(Boolean);
+    if (rows.length) {
+      range = {
+        start: Math.min(...rows.map((r) => r.start)),
+        end: Math.max(...rows.map((r) => r.end)),
+      };
+      label = `选中 ${rows.length} 行字幕`;
+    }
+  }
+  if (!range || !(range.end > range.start)) {
+    toast('请先在时间轴上框选一段区间，或选中几行字幕', 'warn');
+    return;
+  }
+  S.uvrSpan = { start: range.start, end: range.end };
+  $('uvr-span').textContent =
+    `${fmt(range.start)} – ${fmt(range.end)}（${(range.end - range.start).toFixed(1)}s，${label}）`;
+  if (!$('uvr-name').value) {
+    $('uvr-name').value = `主播声纹 ${new Date().toLocaleTimeString()}`;
+  }
+}
+
+/** 用选中区间注册声纹（走 UVR5 分离 → 提取 → 保存）。 */
+async function enrollVoiceprintFromSpan() {
+  const span = S.uvrSpan;
+  if (!span) { toast('请先选择区间（点「用当前框选」）', 'warn'); return; }
+  const name = ($('uvr-name').value || '').trim();
+  if (!name) { toast('请填写声纹名称', 'warn'); return; }
+  if (!S.project || !S.project.meta.video) { toast('请先打开视频', 'warn'); return; }
+  const useUvr = $('uvr-use').checked;
+  const secs = span.end - span.start;
+  if (secs < 2) { toast('区间太短（至少 2 秒）', 'warn'); return; }
+  await runBlocking('正在注册声纹',
+                    useUvr ? 'UVR5 分离人声…（20 秒音频约需 20 秒）' : '提取声纹…',
+                    async () => {
+      try {
+        const d = await apiJson('/api/uvr/enroll', 'POST', {
+          name,
+          input: S.project.meta.video,
+          start: span.start,
+          end: span.end,
+          use_uvr: useUvr,
+        }, { silent: true });
+        if (!d.ok) { toast('注册失败：' + (d.error || ''), 'error', 10000); return; }
+        toast(`已注册声纹「${d.name}」（${d.seconds}s，${d.dim} 维）`, 'ok', 6000);
+        await refreshVoiceList();
+        await refreshUvrStatus();
+      } catch (e) {
+        toast('注册失败：' + e.message, 'error', 10000);
+      }
+    });
+}
+
 // ---------------- 字幕样式：应用到选中 / 全部 ----------------
 
 /** 把当前全局样式写到选中行（或全部行）。 */
@@ -2189,10 +2269,18 @@ function beginMarquee(e) {
   const laneSub = $('lane-sub');
   const rect = lanes.getBoundingClientRect();
   const subRect = laneSub.getBoundingClientRect();
+  // 判断起手位置：在字幕轨里且纵向落在字幕轨上 → 框选字幕；
+  // 否则（视频轨、空白处）→ **拖动平移视图**，这才是用户想要的
+  // 「时间轴能拖动」。
+  const localY = e.clientY - rect.top;
+  // 用「是否落在字幕轨 DOM 上」判断，比算 top 偏移更可靠
+  // （subRect.top 是视口坐标，减去 rect.top 得到的相对偏移容易差一）
+  const inSubLane = e.target.closest('#lane-sub') !== null;
   S._marquee = {
     active: false, startX: e.clientX, startY: e.clientY,
-    originX: e.clientX - rect.left, originY: e.clientY - rect.top,
-    rect, subRect,
+    originX: e.clientX - rect.left, originY: localY,
+    rect, subRect, inSubLane,
+    startView: S.viewStart, panning: false,
     base: new Set(e.ctrlKey || e.metaKey ? S.selection : []),
   };
   window.addEventListener('mousemove', onMarquee);
@@ -2205,6 +2293,27 @@ function onMarquee(e) {
   if (!m) return;
   const dx = e.clientX - m.startX;
   const dy = e.clientY - m.startY;
+
+  // ---- 平移模式：不在字幕轨上起手，且横向拖动超过阈值 ----
+  if (!m.inSubLane) {
+    if (!m.panning) {
+      if (Math.abs(dx) < 4) return;
+      m.panning = true;
+    }
+    // 注意：viewSpan() 返回 {start, span, dur}，**没有 width**。
+    // 早期写成解构 width 会得到 undefined，导致 `width <= 0` 恒真、
+    // 直接 return，表现为「怎么拖都不动」（实测）。
+    const { span } = viewSpan();
+    const width = m.subRect.width || m.rect.width;
+    if (width <= 0) return;
+    const dur = timelineDuration();
+    const hi = Math.max(0, dur - span);
+    S.viewStart = Math.max(0, Math.min(hi,
+                                     m.startView - dx * (span / width)));
+    drawTimeline();
+    return;
+  }
+
   if (!m.active) {
     if (Math.abs(dx) < MARQUEE_THRESHOLD && Math.abs(dy) < MARQUEE_THRESHOLD) {
       return;
@@ -2229,6 +2338,9 @@ function onMarquee(e) {
   // 命中检测：横向按时间区间取交，纵向须覆盖字幕轨
   const t0 = Math.min(xToTime(m.originX), xToTime(curX));
   const t1 = Math.max(xToTime(m.originX), xToTime(curX));
+  // 记录框选的时间区间：供「声纹注册」按区间取用
+  // （UVR5 只需分离这一小段，不必处理整片）
+  if (t1 - t0 >= 1.0) S.marqueeRange = { start: Math.max(0, t0), end: t1 };
   const subTop = subOffset;
   const subBottom = subTop + m.subRect.height;
   const y0 = Math.min(m.originY, curY);
@@ -2252,6 +2364,8 @@ function endMarquee(e) {
   window.removeEventListener('mousemove', onMarquee);
   window.removeEventListener('mouseup', endMarquee);
   if (!m) return;
+  // 平移模式结束：不跳转、不框选（视图已经跟着拖动走了）
+  if (m.panning) return;
   if (!m.active) {
     // 没拖动 = 单击空白处 → 定位播放头（保持原有行为）
     $('video').currentTime = Math.max(
@@ -2261,6 +2375,7 @@ function endMarquee(e) {
   $('marquee').classList.add('hidden');
   $('status-sel').textContent = S.selection.size
     ? `已选中 ${S.selection.size} 行` : '未选中';
+  // S.marqueeRange 已在 onMarquee 中记录（框选的时间区间）
 }
 
 // ---------------- 菜单 / 缩放 ----------------
@@ -2458,6 +2573,11 @@ function bindEvents() {
   $('vp-speak-drop').onclick = () => pickVoiceSample('speak');
   $('vp-sing-drop').onclick = () => pickVoiceSample('sing');
 
+  // 声纹注册（UVR5）
+  $('uvr-use-selection').onclick = useSelectionAsSpan;
+  $('uvr-enroll').onclick = enrollVoiceprintFromSpan;
+  refreshUvrStatus();
+
   // 歌词库
   $('btn-lyrics').onclick = openLyrics;
   $('ly-close').onclick = () => $('modal-lyrics').classList.add('hidden');
@@ -2466,8 +2586,7 @@ function bindEvents() {
   $('ly-paste').onclick = pasteLyric;
 
   // 关键词字库
-  $('kw-add').onclick = addKeyword;
-  $('kw-bulk').onclick = openKeywordManager;
+  $('kw-add').onclick = addKeyword;  $('kw-bulk').onclick = openKeywordManager;
   $('kw-manage').onclick = openKeywordManager;
   $('kw-close').onclick = () => $('modal-keywords').classList.add('hidden');
   $('kw-import').onclick = importKeywords;
@@ -2599,6 +2718,20 @@ function bindEvents() {
       setSpan(viewSpan().span * factor, anchor);
     }
   }, { passive: false });
+
+  // ---------------- 时间轴：按住空白处拖动平移 ----------------
+  //
+  // 之前只能用 Shift+滚轮平移，普通鼠标（尤其笔记本触控板）很难操作，
+  // 用户反馈「时间轴不能拖动」。
+  //
+  // 实现方式注意：不要再加一个 mousedown 监听器！`beginMarquee` 已经
+  // 在同一个 lanes 的 mousedown 里统一处理了空白区域（拖动=框选，
+  // 点击=定位播放头）。早期另加一个监听器会与之冲突：
+  // 平移吃掉了事件，导致点击跳转失效（实测 clickSeeked=false）。
+  // 因此这里只在**框选过程**中判断「是否应改为平移」，由
+  // beginMarquee/onMarquee 里的逻辑决定。
+
+
 
   // 预览字幕：直接按住拖动即定位（自由模式下）
   $('ov-line').addEventListener('mousedown', beginOverlayDrag);
