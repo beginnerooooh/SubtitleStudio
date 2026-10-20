@@ -102,24 +102,37 @@
         <summary>声纹注册（UVR5 分离）</summary>
         <div class="sec-body">
           <p class="muted small">
-            在时间轴上框选一段**主播单独说话或清唱**的区间，用 UVR5
-            分离出人声后注册声纹。分离能有效去掉 BGM 干扰，比直接
-            用原音频注册更准。</p>
+            三种方式都可以：①时间轴框选 ②手动输入起止时间 ③直接导入
+            已分离好的干声文件。用 UVR5 分离能有效去掉 BGM，
+            比直接用原音频更准。</p>
           <div class="kv"><span>UVR5</span>
             <span id="uvr-status" class="muted">检测中…</span></div>
           <div class="field"><label>名称</label>
             <input id="uvr-name" placeholder="例如：主播说话" /></div>
-          <div class="kv"><span>选中区间</span>
-            <span id="uvr-span" class="muted">未选择</span></div>
+          <div class="field"><label>开始</label>
+            <input id="uvr-start" placeholder="11:30 或 690" />
+            <span class="unit">s</span></div>
+          <div class="field"><label>结束</label>
+            <input id="uvr-end" placeholder="11:50 或 710" />
+            <span class="unit">s</span></div>
+          <div class="row-btns">
+            <button id="uvr-use-fill" class="btn sm" title="把播放头位置填入开始时间">用播放头</button>
+          </div>
           <label class="check">
             <input id="uvr-use" type="checkbox" checked /> 用 UVR5 分离人声（推荐）</label>
           <div class="row-btns">
-            <button id="uvr-enroll" class="btn sm accent">注册声纹</button>
+            <button id="uvr-enroll" class="btn sm accent">按区间注册</button>
             <button id="uvr-use-selection" class="btn sm">用当前框选</button>
           </div>
+          <div class="sec-title" style="margin-top:10px">或导入干声文件</div>
           <p class="muted small">
-            提示：在时间轴上按住左键拖动可框选区间（也可先选中字幕，
-            再点「用当前框选」取其时间范围）。</p>
+            已经是纯人声（无 BGM）的音频可直接导入注册，跳过分离。
+            支持 wav/mp3/flac/m4a，会自动转成 16kHz 单声道。</p>
+          <div class="row-btns">
+            <button id="uvr-import" class="btn sm accent">选择干声文件…</button>
+          </div>
+          <div class="kv"><span>已选</span>
+            <span id="uvr-dry-info" class="muted">未选择</span></div>
         </div>
       </details>
 

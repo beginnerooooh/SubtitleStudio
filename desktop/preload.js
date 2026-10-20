@@ -13,6 +13,17 @@ contextBridge.exposeInMainWorld('desktop', {
   openMedia: () => ipcRenderer.invoke('dialog:openMedia'),
   /** 选择弹幕/字幕/音频文件；kind: danmaku | subtitle | audio */
   openFile: (kind) => ipcRenderer.invoke('dialog:openAny', kind),
+  /**
+   * 选择任意文件（带自定义过滤器）。
+   * 供「导入干声」这类场景使用：传 kind='audio' 即可。
+   * 也接受 {title, filters} 形式以支持自定义扩展名。
+   */
+  chooseFile: (kindOrOpts) => {
+    if (kindOrOpts && typeof kindOrOpts === 'object') {
+      return ipcRenderer.invoke('dialog:openAny', 'custom', kindOrOpts);
+    }
+    return ipcRenderer.invoke('dialog:openAny', kindOrOpts || 'audio');
+  },
   /** 选择导出目录（返回绝对路径，空串表示取消） */
   chooseDir: () => ipcRenderer.invoke('dialog:chooseDir'),
   /** 另存为（返回绝对路径，空串表示取消） */

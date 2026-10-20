@@ -214,9 +214,12 @@ function busyProgress(ratio, sub) {
 const MAX_BUSY_MS = 20 * 60 * 1000;      // 20 分钟：足够覆盖最长转码
 
 async function withBusy(label, fn) {
-  // 兜底：发现卡死过久的残留计数就复位
+  // 兜底：发现卡死过久的残留计数就复位。
+  // 用 Busy.maxMs（本次任务的容忍上限）而不是固定的 MAX_BUSY_MS：
+  // 识别任务需要两三个小时的上限，用 20 分钟会把它误判为卡死。
+  const staleMs = Busy.maxMs || MAX_BUSY_MS;
   if (Busy.depth > 0 && Busy.startedAt
-      && Date.now() - Busy.startedAt > MAX_BUSY_MS) {
+      && Date.now() - Busy.startedAt > staleMs) {
     Busy.depth = 0;
     busyHide();
   }
@@ -252,10 +255,13 @@ async function withBusy(label, fn) {
  * 因为调用方（如视频转码）本身可能已在别处占用计数。
  * 无论如何都会在结束时把计数归零，杜绝泄漏。
  */
-async function runBlocking(label, sub, fn) {
+async function runBlocking(label, sub, fn, opts) {
   const saved = Busy.depth;
   Busy.depth = Math.max(1, Busy.depth);
   Busy.startedAt = Date.now();
+  // 本次阻塞的容忍上限：长任务（识别）需要远超通用的 20 分钟，
+  // 否则任务还在跑就被判定卡死、复位、误报失败。
+  Busy.maxMs = (opts && opts.maxMs) || MAX_BUSY_MS;
   busyShow(label, sub || '');
   try {
     return await fn();
@@ -588,17 +594,69 @@ async function preparePlayable(path) {
     });
 }
 
-async function loadFilmstrip(path) {
+/**
+ * 加载时间轴视频轨的胶片条。
+ *
+ * 关键：必须按**当前视图区间**（viewStart ~ viewStart+span）取帧，
+ * 否则胶片条是一张固定的整片缩略图，时间轴滑到哪里都显示同样的画面，
+ * 看起来「缩略图不对应时间」。
+ *
+ * 为了不打爆后端，做两层保护：
+ *   - 拖动时先显示**已经加载过的最近一张**（旧图），松手后再刷新；
+ *   - 请求做 400ms 防抖 + 复用同一张图避免闪烁。
+ */
+let _fsTimer = 0;
+let _fsLastKey = '';
+let _fsSeq = 0;
+
+function scheduleFilmstrip() {
+  clearTimeout(_fsTimer);
+  _fsTimer = setTimeout(() => { refreshFilmstrip(); }, 400);
+}
+
+async function refreshFilmstrip() {
+  const path = S.project && S.project.meta && S.project.meta.video;
   const img = $('filmstrip');
+  if (!path || !img) return;
+  const vid = $('video');
+  // 用源文件时长（不依赖代理片段），保证刻度与内容一致。
+  // 兜底：sourceDuration 还没探测到时先用视频元素时长，
+  // 否则 dur 为 0 会直接 return，胶片条永远不更新。
+  let dur = S.sourceDuration || (vid && vid.duration) || 0;
+  if (!(dur > 0)) return;
+  const span = viewSpan().span;
+  const start = Math.max(0, Math.min(Math.max(0, dur - span), S.viewStart));
+  // 可视宽度决定需要多少帧：窄了会糊，多了浪费
+  const width = Math.max(240, ($('tl-lanes') && $('tl-lanes').clientWidth) || 800);
+  const count = Math.max(8, Math.min(80, Math.round(width / 70)));
+  const key = `${Math.round(start * 2)}_${Math.round(span * 2)}_${count}`;
+  if (key === _fsLastKey) return;       // 同一区间不重复请求
+  _fsLastKey = key;
+  const seq = ++_fsSeq;
+  const url = `${API_BASE()}/api/thumbs?path=${encodeURIComponent(path)}`
+    + `&count=${count}&start=${start.toFixed(1)}&span=${span.toFixed(1)}`
+    + `&height=${Math.round(40 * (window.devicePixelRatio || 1))}`;
+  img.onload = () => {
+    if (seq !== _fsSeq) return;         // 已被更新的请求取代
+    $('filmstrip-hint').classList.add('hidden');
+    img.style.opacity = '1';
+  };
+  img.onerror = () => {
+    if (seq !== _fsSeq) return;
+    $('filmstrip-hint').textContent = '无法生成缩略图（不影响编辑）';
+    $('filmstrip-hint').classList.remove('hidden');
+  };
+  img.src = url;
+}
+
+async function loadFilmstrip(path) {
   const hint = $('filmstrip-hint');
-  hint.textContent = '正在生成画面缩略…';
-  hint.classList.remove('hidden');
-  const dur = $('video').duration || 0;
-  const count = Math.max(12, Math.min(80, Math.round((dur || 600) / 10)));
-  img.src = `${API_BASE()}/api/thumbs?path=${encodeURIComponent(path)}`
-    + `&count=${count}&height=${Math.round(40 * (window.devicePixelRatio || 1))}`;
-  img.onload = () => { hint.classList.add('hidden'); };
-  img.onerror = () => { hint.textContent = '无法生成缩略图（不影响编辑）'; };
+  if (hint) {
+    hint.textContent = '正在生成画面缩略…';
+    hint.classList.remove('hidden');
+  }
+  _fsLastKey = '';                      // 换视频后强制重取
+  await refreshFilmstrip();
 }
 
 async function ensureProject() {
@@ -711,46 +769,64 @@ async function startGenerate() {
 
 /** 轮询生成任务，同时把进度写进居中弹窗。 */
 async function pollJobWhileBusy() {
-  await runBlocking('正在识别字幕', '准备中…', () => pollJob());
+  // 识别是全流程最长的操作：实测 72 分钟素材约需 9 分钟 ASR，
+  // 加上歌曲识别/歌词对齐/时间轴校正整体可达 15~25 分钟。
+  // 因此这里单独放宽超时，不能用通用的 20 分钟上限，
+  // 否则任务还在跑就被判定「卡死」并复位，用户看到的是「识别失败」。
+  await runBlocking('正在识别字幕', '准备中…',
+                    () => pollJob(), { maxMs: 3 * 60 * 60 * 1000 });
 }
 
 async function pollJob() {
   if (!S.job) return;
   let done = false;
-  try {
-    const j = await apiJson(`/api/jobs/${S.job}`, 'GET', undefined,
-                            { silent: true });
-    $('progress-bar').style.width = `${Math.min(100, (j.ratio || 0) * 100)}%`;
-    $('progress-text').textContent = j.message || '';
-    busyProgress(Number.isFinite(j.ratio) ? j.ratio : null, j.message || '');
-    if (j.log && j.log.length) {
-      const atBottom = $('log').scrollTop + $('log').clientHeight
-        >= $('log').scrollHeight - 30;
-      $('log').textContent = j.log.join('\n');
-      if (atBottom) $('log').scrollTop = $('log').scrollHeight;
+  let netErrors = 0;              // 连续网络错误次数（容忍抖动）
+  while (!done) {
+    try {
+      const j = await apiJson(`/api/jobs/${S.job}`, 'GET', undefined,
+                              { silent: true });
+      netErrors = 0;
+      $('progress-bar').style.width = `${Math.min(100, (j.ratio || 0) * 100)}%`;
+      $('progress-text').textContent = j.message || '';
+      busyProgress(Number.isFinite(j.ratio) ? j.ratio : null, j.message || '');
+      if (j.log && j.log.length) {
+        const atBottom = $('log').scrollTop + $('log').clientHeight
+          >= $('log').scrollHeight - 30;
+        $('log').textContent = j.log.join('\n');
+        if (atBottom) $('log').scrollTop = $('log').scrollHeight;
+      }
+      if (j.status === 'done') {
+        done = true;
+        busyProgress(1, '正在写入结果…');
+        await applyResult(j.result);
+      } else if (j.status === 'error') {
+        done = true;
+        // 失败时把错误写进日志面板，便于用户复制反馈
+        $('progress-bar').style.width = '100%';
+        $('progress-text').textContent = '失败：' + j.error;
+        busyProgress(null, '失败：' + j.error);
+        toast('识别失败：' + j.error, 'error', 12000);
+        if ($('log')) {
+          $('log').textContent += `\n[失败] ${j.error}\n`;
+          setDrawer(true);
+        }
+      }
+    } catch (e) {
+      // 单次请求失败不代表任务失败（后端可能正忙）：连续失败 5 次才放弃
+      netErrors += 1;
+      if (netErrors >= 5) {
+        done = true;
+        $('progress-text').textContent = '轮询失败：' + e.message;
+        busyProgress(null, '轮询失败：' + e.message);
+        toast('无法获取任务状态：' + e.message
+              + '（任务可能仍在后台运行）', 'error', 10000);
+      }
     }
-    if (j.status === 'done') {
-      done = true;
-      busyProgress(1, '正在写入结果…');
-      await applyResult(j.result);
-    } else if (j.status === 'error') {
-      done = true;
-      $('progress-text').textContent = '失败：' + j.error;
-      busyProgress(null, '失败：' + j.error);
-      toast('识别失败：' + j.error, 'error');
-    }
-  } catch (e) {
-    $('progress-text').textContent = '轮询失败：' + e.message;
-    busyProgress(null, '轮询失败：' + e.message);
+    if (!done) await new Promise((r) => setTimeout(r, 1200));
   }
-  if (done) {
-    S.job = '';
-    $('btn-generate').disabled = false;
-    $('btn-cancel').disabled = true;
-    return;
-  }
-  await new Promise((r) => setTimeout(r, 700));
-  return pollJob();
+  S.job = '';
+  $('btn-generate').disabled = false;
+  $('btn-cancel').disabled = true;
 }
 
 async function applyResult(result) {
@@ -1247,6 +1323,10 @@ function drawTimeline() {
   renderClips();
   updatePlayhead();
   updateZoomUI();
+  // 胶片条跟随视图：平移/缩放后重新按可见区间取帧。
+  // 用防抖封装（scheduleFilmstrip）而不是直接 await，
+  // 避免拖动时每一帧都发请求。
+  scheduleFilmstrip();
 }
 
 function updatePlayhead() {
@@ -1816,7 +1896,7 @@ async function refreshUvrStatus() {
   }
 }
 
-/** 把当前框选/选中的时间范围填到「选中区间」。 */
+/** 把当前框选/选中的时间范围填到起止输入框。 */
 function useSelectionAsSpan() {
   // 优先用时间轴框选（S.marqueeRange），其次用选中字幕的时间范围
   let range = S.marqueeRange;
@@ -1836,24 +1916,67 @@ function useSelectionAsSpan() {
     toast('请先在时间轴上框选一段区间，或选中几行字幕', 'warn');
     return;
   }
-  S.uvrSpan = { start: range.start, end: range.end };
-  $('uvr-span').textContent =
-    `${fmt(range.start)} – ${fmt(range.end)}（${(range.end - range.start).toFixed(1)}s，${label}）`;
+  $('uvr-start').value = fmt(range.start);
+  $('uvr-end').value = fmt(range.end);
+  toast(`已填入区间（${label}，${(range.end - range.start).toFixed(1)}s）`,
+        'ok', 2500);
   if (!$('uvr-name').value) {
     $('uvr-name').value = `主播声纹 ${new Date().toLocaleTimeString()}`;
   }
 }
 
-/** 用选中区间注册声纹（走 UVR5 分离 → 提取 → 保存）。 */
+/** 解析用户输入的时间：支持 `690`、`11:30`、`00:11:30:00`、`00:11:30`。 */
+function parseTimeInput(text) {
+  const s = String(text || '').trim();
+  if (!s) return NaN;
+  // 纯数字：秒
+  if (/^\d+(\.\d+)?$/.test(s)) return Number(s);
+  // 冒号分隔：可能是 分:秒 / 时:分:秒 / 时:分:秒:帧
+  const parts = s.split(':').map((x) => x.trim());
+  if (parts.some((x) => x === '' || isNaN(Number(x)))) return NaN;
+  const nums = parts.map(Number);
+  if (nums.length === 2) return nums[0] * 60 + nums[1];
+  if (nums.length === 3) return nums[0] * 3600 + nums[1] * 60 + nums[2];
+  if (nums.length === 4) {
+    // 时:分:秒:帧 —— 帧按当前 FPS 折算
+    return nums[0] * 3600 + nums[1] * 60 + nums[2]
+      + (FPS > 0 ? nums[3] / FPS : 0);
+  }
+  return NaN;
+}
+
+/** 把播放头位置填入「开始」。 */
+function fillStartFromPlayhead() {
+  const t = $('video').currentTime || 0;
+  $('uvr-start').value = fmt(t);
+  if (!$('uvr-end').value) {
+    // 默认取 20 秒，太短不利声纹质量
+    $('uvr-end').value = fmt(Math.min(timelineDuration(), t + 20));
+  }
+}
+
+/** 从输入框读取区间；无效时提示并返回 null。 */
+function readSpanInputs() {
+  const a = parseTimeInput($('uvr-start').value);
+  const b = parseTimeInput($('uvr-end').value);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) {
+    toast('时间格式无效。可填 690、11:30 或 00:11:30', 'warn');
+    return null;
+  }
+  if (b <= a) { toast('结束时间必须大于开始时间', 'warn'); return null; }
+  if (b - a < 2) { toast('区间太短（至少 2 秒）', 'warn'); return null; }
+  return { start: a, end: b };
+}
+
+/** 用输入框区间注册声纹（走 UVR5 分离 → 提取 → 保存）。 */
 async function enrollVoiceprintFromSpan() {
-  const span = S.uvrSpan;
-  if (!span) { toast('请先选择区间（点「用当前框选」）', 'warn'); return; }
+  const span = readSpanInputs();
+  if (!span) return;
   const name = ($('uvr-name').value || '').trim();
   if (!name) { toast('请填写声纹名称', 'warn'); return; }
   if (!S.project || !S.project.meta.video) { toast('请先打开视频', 'warn'); return; }
   const useUvr = $('uvr-use').checked;
   const secs = span.end - span.start;
-  if (secs < 2) { toast('区间太短（至少 2 秒）', 'warn'); return; }
   await runBlocking('正在注册声纹',
                     useUvr ? 'UVR5 分离人声…（20 秒音频约需 20 秒）' : '提取声纹…',
                     async () => {
@@ -1872,7 +1995,35 @@ async function enrollVoiceprintFromSpan() {
       } catch (e) {
         toast('注册失败：' + e.message, 'error', 10000);
       }
-    });
+    }, { maxMs: 30 * 60 * 1000 });
+}
+
+/** 选择干声文件并注册（跳过分离）。 */
+async function importDryVoice() {
+  if (!window.desktop) {
+    toast('浏览器模式不支持文件选择，请用桌面版', 'warn');
+    return;
+  }
+  const path = await window.desktop.chooseFile(
+    '选择干声文件', [{ name: '音频', extensions: ['wav', 'mp3', 'flac', 'm4a',
+                                                'aac', 'ogg', 'opus'] }]);
+  if (!path) return;
+  const name = ($('uvr-name').value || '').trim()
+    || `导入声纹 ${new Date().toLocaleTimeString()}`;
+  $('uvr-dry-info').textContent = path.split(/[\\/]/).pop();
+  await runBlocking('正在导入干声', '转换采样率并提取声纹…', async () => {
+    try {
+      const d = await apiJson('/api/uvr/enroll', 'POST', {
+        name, input: path, start: 0, end: 0, use_uvr: false, whole: true,
+      }, { silent: true });
+      if (!d.ok) { toast('导入失败：' + (d.error || ''), 'error', 10000); return; }
+      toast(`已从干声导入声纹「${d.name}」（${d.seconds}s，${d.dim} 维）`,
+            'ok', 6000);
+      await refreshVoiceList();
+    } catch (e) {
+      toast('导入失败：' + e.message, 'error', 10000);
+    }
+  }, { maxMs: 30 * 60 * 1000 });
 }
 
 // ---------------- 字幕样式：应用到选中 / 全部 ----------------
@@ -2575,7 +2726,9 @@ function bindEvents() {
 
   // 声纹注册（UVR5）
   $('uvr-use-selection').onclick = useSelectionAsSpan;
+  $('uvr-use-fill').onclick = fillStartFromPlayhead;
   $('uvr-enroll').onclick = enrollVoiceprintFromSpan;
+  $('uvr-import').onclick = importDryVoice;
   refreshUvrStatus();
 
   // 歌词库

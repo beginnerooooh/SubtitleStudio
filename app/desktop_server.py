@@ -208,8 +208,13 @@ def start_job(cfg_kwargs: dict, req_kwargs: dict) -> str:
 
 # ---------------- HTTP 处理 ----------------
 
-def _build_filmstrip(src: Path, dst: Path, count: int, height: int) -> bool:
+def _build_filmstrip(src: Path, dst: Path, count: int, height: int,
+                     start: float = 0.0, span: float = 0.0) -> bool:
     """用 ffmpeg 抽帧并拼接为一张 PNG（胶片条）。
+
+    `start`/`span` 指定区间：时间轴平移或缩放后只抽当前可见区间，
+    这样缩略图与时间刻度对得上（否则永远显示整片的第一印象）。
+    `span<=0` 时取整片。
 
     三种做法实测对比（2GB / 50 分钟 1080p，抽 20 帧）：
     | 做法 | 耗时 |
@@ -220,7 +225,6 @@ def _build_filmstrip(src: Path, dst: Path, count: int, height: int) -> bool:
 
     采用最快的一种：对每个采样点单独 `-ss` 跳读抽一帧（seek 直接定位到
     关键帧附近，无需解码中间内容），再用 concat + tile 拼成一张图。
-    采样点均匀分布在整片，得到剪辑软件那样的胶片条。
     """
     from core.env import detect_env
 
@@ -237,6 +241,15 @@ def _build_filmstrip(src: Path, dst: Path, count: int, height: int) -> bool:
     if dur <= 0:
         dur = 60.0
 
+    # 限定到请求的区间，并夹在有效范围内
+    base = max(0.0, float(start or 0.0))
+    if span and span > 0:
+        win = min(float(span), max(0.5, dur - base))
+    else:
+        win = max(0.5, dur - base)
+    if base >= dur:
+        base = max(0.0, dur - win)
+
     import shutil
     import subprocess
     import tempfile
@@ -245,7 +258,9 @@ def _build_filmstrip(src: Path, dst: Path, count: int, height: int) -> bool:
     try:
         tiles = []
         for i in range(n):
-            t = dur * (i + 0.5) / n
+            # 采样点落在 [base, base+win) 区间内：
+            # 这样时间轴滑到哪，胶片条就显示那段画面。
+            t = base + win * (i + 0.5) / n
             f = work / f"t{i:03d}.png"
             proc = subprocess.run(
                 [ffmpeg, "-y", "-v", "error", "-ss", f"{t:.3f}",
@@ -834,7 +849,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/thumbs":
             return self._thumbs((query.get("path") or [""])[0],
                                 float((query.get("count") or ["60"])[0]),
-                                float((query.get("height") or ["44"])[0]))
+                                float((query.get("height") or ["44"])[0]),
+                                float((query.get("start") or ["0"])[0]),
+                                float((query.get("span") or ["0"])[0]))
         return self._send_error_json("未知接口：" + path, 404)
 
     def _route_post(self) -> None:
@@ -973,6 +990,7 @@ class Handler(BaseHTTPRequestHandler):
 
         name = (body.get("name") or "").strip()
         src = (body.get("input") or "").strip()
+        whole = bool(body.get("whole"))
         try:
             start = float(body.get("start") or 0.0)
             end = float(body.get("end") or 0.0)
@@ -983,14 +1001,16 @@ class Handler(BaseHTTPRequestHandler):
         if not src or not Path(src).is_file():
             return self._send_json(
                 {"ok": False, "error": f"视频/音频不存在：{src}"}, 400)
-        if end <= start:
-            return self._send_json(
-                {"ok": False, "error": "区间无效：结束时间必须大于开始时间"}, 400)
-        if end - start < 2.0:
-            return self._send_json(
-                {"ok": False, "error": "区间太短（至少 2 秒）"}, 400)
+        # whole=True：整段导入（外部干声文件，跳过区间检查）
+        if not whole:
+            if end <= start:
+                return self._send_json(
+                    {"ok": False, "error": "区间无效：结束时间必须大于开始时间"}, 400)
+            if end - start < 2.0:
+                return self._send_json(
+                    {"ok": False, "error": "区间太短（至少 2 秒）"}, 400)
 
-        use_uvr = bool(body.get("use_uvr", True))
+        use_uvr = bool(body.get("use_uvr", True)) and not whole
         device = body.get("device") or "cpu"
         cache = CACHE_DIR / "voiceprint"
         cache.mkdir(parents=True, exist_ok=True)
@@ -1002,16 +1022,20 @@ class Handler(BaseHTTPRequestHandler):
                 uvr5.separate_segment_for_voiceprint(
                     src, str(vocal), start, end)
             else:
-                # 不分离：直接切段并重采样到 16k
+                # 不分离：直接转成 16kHz 单声道。
+                # whole=True 表示整段导入（外部干声），不切时间段；
+                # 否则按 start/end 切。
                 ff = detect_env().ffmpeg_path or "ffmpeg"
                 import subprocess
 
-                subprocess.run(
-                    [ff, "-y", "-v", "error", "-ss", f"{start:.3f}",
-                     "-t", f"{end - start:.3f}", "-i", src,
-                     "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
-                     str(vocal)],
-                    check=True, capture_output=True)
+                cmd = [ff, "-y", "-v", "error"]
+                if not whole:
+                    cmd += ["-ss", f"{start:.3f}",
+                            "-t", f"{end - start:.3f}"]
+                cmd += ["-i", src,
+                        "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+                        str(vocal)]
+                subprocess.run(cmd, check=True, capture_output=True)
             engine = VoiceprintEngine(device=device)
             # enroll(wav, start, end) 的参数是**秒**（内部 _cap 会按文件
             # 时长裁剪）。这里传 0 到实际时长即可，别传 1e9 ——
@@ -1026,7 +1050,9 @@ class Handler(BaseHTTPRequestHandler):
 
         return self._send_json({
             "ok": True, "name": name, "path": str(saved),
-            "wav": str(vocal), "seconds": round(end - start, 2),
+            "wav": str(vocal),
+            # whole 导入时 end-start 为 0，应回报实际音频时长
+            "seconds": round(dur if whole else (end - start), 2),
             "uvr": use_uvr, "dim": int(len(vec)),
         })
 
@@ -1381,11 +1407,14 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- 视频轨缩略图（剪辑软件的胶片条） ----------
 
-    def _thumbs(self, target: str, count: float, height: float) -> None:
+    def _thumbs(self, target: str, count: float, height: float,
+                start: float = 0.0, span: float = 0.0) -> None:
         """按等间隔抽帧，拼成横向胶片条（一张 PNG，供时间轴视频轨显示）。
 
+        `start`/`span` 指定时间区间：时间轴平移或缩放后，只取当前可见
+        区间对应的画面，这样缩略图才会随视图滑动而更新。
+        `span<=0` 时取整片（旧行为）。
         只抽一次、缓存到 cache/thumbs/，避免每次重绘都跑 ffmpeg。
-        抽帧失败（无 ffmpeg / 非视频）时返回 404，前端会退化为纯色轨道。
         """
         if not target:
             return self._send_error_json("缺少 path 参数", 400)
@@ -1398,10 +1427,13 @@ class Handler(BaseHTTPRequestHandler):
         h = max(24, min(120, int(height or 44)))
         cache = CACHE_DIR / "thumbs"
         cache.mkdir(parents=True, exist_ok=True)
-        key = f"{_file_key(p, 'thumbs', n, h)}.png"
+        # 起止时间按 0.5 秒取整做键：轻微拖动不会反复重新抽帧
+        s0 = max(0.0, round(float(start or 0.0) * 2) / 2)
+        sp = max(0.0, round(float(span or 0.0) * 2) / 2)
+        key = f"{_file_key(p, 'thumbs', n, h, s0, sp)}.png"
         out = cache / key
         if not out.is_file():
-            if not _build_filmstrip(p, out, n, h):
+            if not _build_filmstrip(p, out, n, h, start=s0, span=sp):
                 return self._send_error_json("无法生成缩略图", 404)
         data = out.read_bytes()
         self.send_response(200)

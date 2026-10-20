@@ -105,7 +105,9 @@ body {
  * （实测：左面板只有 457px，而编辑器区域高 600+）。 */
 .panel { background: var(--panel); display: flex; flex-direction: column;
          flex: 0 0 auto; min-height: 0; align-self: stretch; }
-.panel-left { width: 224px; flex-basis: 224px; overflow-y: auto; }
+/* 左栏宽度 224 → 248：声纹注册区有「开始/结束」两个时间输入框
+ * 并排，224px 下会被挤到换行、按钮溢出（实测截图确认）。 */
+.panel-left { width: 248px; flex-basis: 248px; overflow-y: auto; }
 .panel-right { width: 268px; flex-basis: 268px; overflow: hidden; }
 .panel.hidden { display: none; }
 

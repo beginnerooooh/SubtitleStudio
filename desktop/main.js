@@ -278,20 +278,24 @@ ipcMain.handle('dialog:openMedia', async () => {
   return r.canceled ? '' : r.filePaths[0];
 });
 
-ipcMain.handle('dialog:openAny', async (_e, kind) => {
+ipcMain.handle('dialog:openAny', async (_e, kind, opts) => {
   const filters = {
     danmaku: [{ name: '弹幕', extensions: ['xml', 'jsonl'] }],
     subtitle: [{ name: '字幕', extensions: ['srt', 'ass', 'vtt', 'lrc', 'json'] }],
-    audio: [{ name: '音频', extensions: ['wav', 'mp3', 'flac', 'm4a'] }],
+    audio: [{ name: '音频', extensions: ['wav', 'mp3', 'flac', 'm4a', 'aac',
+                                       'ogg', 'opus', 'wma'] }],
     lyrics: [{ name: '歌词', extensions: ['lrc', 'txt', 'srt', 'json'] }],
     media: [{ name: '音视频',
               extensions: ['mp4', 'mkv', 'flv', 'mov', 'webm', 'ts', 'avi',
                            'wmv', 'rmvb', 'mp3', 'wav', 'm4a', 'flac'] }],
   };
+  // custom：调用方自带 {title, filters}
+  const custom = opts && typeof opts === 'object' ? opts : null;
   const r = await dialog.showOpenDialog(mainWindow, {
-    title: '选择文件',
+    title: (custom && custom.title) || '选择文件',
     properties: ['openFile'],
-    filters: filters[kind] || [{ name: '全部', extensions: ['*'] }],
+    filters: (custom && custom.filters)
+      || filters[kind] || [{ name: '全部', extensions: ['*'] }],
   });
   return r.canceled ? '' : r.filePaths[0];
 });

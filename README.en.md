@@ -465,9 +465,13 @@ Conventions:
 When UVR5 (Ultimate Vocal Remover 5) is installed locally, its models can be
 reused for **segment-level vocal separation** before voiceprint enrollment:
 
-1. Drag-select a segment where the streamer talks or sings alone
-2. Click "enroll voiceprint" — the UVR5 MDX model extracts the vocal (removing BGM)
-3. Resample to 16 kHz → extract a 192-dim embedding → save
+Three ways to enroll:
+
+1. **Drag-select** a segment where the streamer talks or sings alone
+2. **Type the range** in the left panel (`690`, `11:30`, `00:11:30`, `00:11:30:15`)
+3. **Import a dry vocal file** (wav/mp3/flac/m4a… — converted to 16 kHz automatically)
+Click "enroll" → the UVR5 MDX model extracts the vocal (removing BGM) →
+resample to 16 kHz → extract a 192-dim embedding → save
 
 Measured: a 20-second segment takes about 20 seconds end to end.
 

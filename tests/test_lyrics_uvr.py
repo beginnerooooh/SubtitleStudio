@@ -236,3 +236,52 @@ def test_pan_clamps_when_proxy_shorter_than_span():
     start = js.index("if (!m.inSubLane)")
     seg = js[start: start + 900]
     assert "Math.max(0, dur - span)" in seg
+
+
+# ---------------- 前端脚本必须能编译 ----------------
+
+def _run_structure_check(target: Path) -> tuple[int, str]:
+    """调用 tools/check_js_structure.js 检查指定 JS 文件。"""
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("未安装 node")
+    script = ROOT / "tools" / "check_js_structure.js"
+    assert script.is_file(), "缺少 tools/check_js_structure.js"
+    proc = subprocess.run([node, str(script), str(target)],
+                          capture_output=True, encoding="utf-8",
+                          errors="replace", timeout=120)
+    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+
+def test_renderer_app_js_compiles():
+    """回归：app.js 必须能真正编译通过。
+
+    关键：`node --check` **漏报**了 `await` 位于非 async 函数中的错误
+    ——实测 `node --check` 返回 0，但浏览器加载时抛 SyntaxError，
+    整个界面变成白板（所有按钮失效）。必须用 `new vm.Script()` 编译。
+    """
+    rc, out = _run_structure_check(ROOT / "desktop" / "renderer" / "app.js")
+    assert rc == 0, "app.js 结构检查失败（浏览器会白屏）：\n" + out[:1500]
+
+
+def test_structure_checker_catches_bad_await():
+    """自检：检查工具本身必须能发现 await 位置错误。
+
+    否则这个守卫是假的——测试会一直「通过」却抓不到问题。
+    """
+    import tempfile
+
+    bad = "function ok() {\n  return 1;\n}\n  await foo();\n"
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False,
+                                     encoding="utf-8") as f:
+        f.write(bad)
+        tmp = Path(f.name)
+    try:
+        rc, out = _run_structure_check(tmp)
+        assert rc != 0, "检查器没能发现 await 位置错误，守卫失效"
+        assert "await" in out.lower()
+    finally:
+        tmp.unlink(missing_ok=True)
