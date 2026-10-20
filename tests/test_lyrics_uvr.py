@@ -285,3 +285,107 @@ def test_structure_checker_catches_bad_await():
         assert "await" in out.lower()
     finally:
         tmp.unlink(missing_ok=True)
+
+
+# ---------------- speechbrain Windows 递归修复 ----------------
+
+def test_sb_compat_patches_lazy_module():
+    """回归：speechbrain 的 LazyModule 必须被打上跨平台补丁。
+
+    根因：speechbrain 的 `ensure_module` 用
+      `importer_frame.filename.endswith("/inspect.py")`
+    判断调用栈是否来自 inspect，但 Windows 路径是反斜杠，
+    该判断**永远为 False** → 防护失效 → 无限递归：
+      __getattr__ → ensure_module → inspect.getmodule
+      → __getattr__ → ...
+    """
+    from core import sb_compat
+
+    ok = sb_compat.apply_patch()
+    assert ok, "补丁应成功应用（未安装 speechbrain 时才会失败）"
+    assert sb_compat.patched()
+
+    import speechbrain.utils.importutils as iu
+
+    assert "ensure_module" in iu.LazyModule.__dict__, \
+        "LazyModule.ensure_module 应被替换（不能只改实例）"
+
+
+def test_sb_compat_is_idempotent():
+    """补丁可重复调用，不会层层包装。"""
+    from core import sb_compat
+
+    assert sb_compat.apply_patch() is True
+    import speechbrain.utils.importutils as iu
+
+    first = iu.LazyModule.ensure_module
+    sb_compat.apply_patch()
+    assert iu.LazyModule.ensure_module is first, "重复调用不应再次包装"
+
+
+def test_sb_compat_handles_windows_paths():
+    """回归：判断「来自 inspect.py」必须跨平台。
+
+    直接验证 os.path.basename 判断在反斜杠路径下也成立——
+    这正是官方实现漏掉的地方。
+    """
+    import os
+
+    win_path = r"C:\Python311\Lib\inspect.py"
+    posix = "/usr/lib/python3.11/inspect.py"
+    assert os.path.basename(win_path) == "inspect.py"
+    assert os.path.basename(posix) == "inspect.py"
+    # 官方写法在 Windows 路径上失效（这就是 bug 本身）
+    assert not win_path.endswith("/inspect.py")
+
+
+def test_voiceprint_load_applies_patch():
+    """回归：声纹模型加载前必须先打补丁。"""
+    src = (ROOT / "app" / "core" / "voiceprint.py").read_text(encoding="utf-8")
+    assert "sb_compat" in src, "voiceprint 加载前应调用 sb_compat.apply_patch()"
+    assert src.index("sb_compat.apply_patch") < src.index(
+        "from speechbrain.inference.speaker import"), \
+        "补丁必须在导入 speechbrain 之前应用"
+
+
+def test_streamer_load_applies_patch():
+    """回归：streamer 的 ECAPA 加载同样要打补丁。"""
+    src = (ROOT / "app" / "core" / "streamer.py").read_text(encoding="utf-8")
+    assert "sb_compat" in src
+    assert src.index("sb_compat.apply_patch") < src.index(
+        "from speechbrain.inference.speaker import")
+
+
+# ---------------- 声纹注册：列表刷新 ----------------
+
+def test_enroll_uses_real_duration_not_huge_number():
+    """回归：enroll() 的时间参数必须用实际时长，不能传 1e9。
+
+    `enroll(wav, start, end)` 的参数是**秒**，内部 `_cap` 会按文件时长
+    裁剪。传 1e9 会被算成越界区间并抛
+    「无效音频区间：[499999985.0, 500000015.0)」（实测踩坑）。
+    """
+    src = (ROOT / "app" / "desktop_server.py").read_text(encoding="utf-8")
+    assert "engine.enroll(speak, 0.0, 1e9)" not in src, \
+        "/api/profiles 仍在使用 1e9 作为结束时间"
+    assert "_wav_seconds" in src, "应使用 _wav_seconds 取实际时长"
+
+
+def test_frontend_refreshes_both_voiceprint_lists():
+    """回归：注册成功后必须同时刷新「弹窗列表」和「工具栏下拉框」。
+
+    实测事故：UVR 注册成功后只调了 refreshVoiceList()（刷新弹窗的
+    vp-list），没调 loadProfiles()（刷新 #profile 下拉框），
+    用户看到的现象是「注册了但列表里没有新声纹」。
+    """
+    js = _desktop("app.js")
+    for anchor in ("async function enrollVoiceprintFromSpan",
+                   "async function importDryVoice"):
+        start = js.index(anchor)
+        nxt = js.find("\nasync function ", start + 10)
+        nxt2 = js.find("\nfunction ", start + 10)
+        end = min(x for x in (nxt, nxt2, len(js)) if x > 0)
+        body = js[start:end]
+        assert "refreshVoiceList()" in body, f"{anchor} 缺少 refreshVoiceList()"
+        assert "loadProfiles()" in body, (
+            f"{anchor} 缺少 loadProfiles()——下拉框不会出现新声纹")

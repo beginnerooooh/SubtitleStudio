@@ -474,6 +474,7 @@ ONNX 权重，可以直接加载——这样还能按需只分离选中的小段
 | 分离结果近乎静音、频谱重心 13kHz | 多算一步「掩码 = \|out\|/\|in\|」 | MDX 是「谱到谱」映射，输出即人声谱 |
 | 只有首尾几百毫秒有声音 | 分块重叠区直接赋值，未覆盖帧保持全零 | 幅度累加取平均 + 沿用原谱相位 |
 | 声纹引擎报「无效音频区间」 | `enroll()` 的时间参数是秒，传 `1e9` 会被 `_cap` 判为越界 | 先取 WAV 实际时长再传 |
+| `RecursionError: maximum recursion depth exceeded` | speechbrain 的 `LazyModule` 用 `filename.endswith("/inspect.py")` 判断调用栈来源，**Windows 路径是反斜杠**，防护永远失效 → 无限递归 | `core/sb_compat.py` 运行时打补丁，改用 `os.path.basename` 判断 |
 | 声纹引擎报「必须 16000Hz」 | MDX 要 44.1kHz | 分离后再重采样到 16kHz |
 
 未安装 UVR5 时自动退化为直接用原音频注册（不报错）。

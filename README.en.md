@@ -488,6 +488,7 @@ ONNX weights, though, so they can be loaded directly. That also lets us separate
 | near-silent output, spectral centroid at 13 kHz | applied an extra mask = |out|/|in| | MDX is spectrum-to-spectrum; its output *is* the vocal spectrum |
 | only the first/last few hundred ms audible | overlapping blocks assigned directly, uncovered frames stayed zero | accumulate magnitudes and average, reuse the original phase |
 | "must be 16000 Hz" from the voiceprint engine | MDX requires 44.1 kHz | resample to 16 kHz after separation |
+| `RecursionError: maximum recursion depth exceeded` | speechbrain's `LazyModule` checks `filename.endswith("/inspect.py")` — but Windows paths use backslashes, so the guard never fires and recursion runs away | `core/sb_compat.py` patches it at runtime to use `os.path.basename` |
 
 Without UVR5 it degrades gracefully to enrolling from the raw audio.
 

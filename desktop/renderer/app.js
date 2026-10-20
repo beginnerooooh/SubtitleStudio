@@ -1990,8 +1990,19 @@ async function enrollVoiceprintFromSpan() {
         }, { silent: true });
         if (!d.ok) { toast('注册失败：' + (d.error || ''), 'error', 10000); return; }
         toast(`已注册声纹「${d.name}」（${d.seconds}s，${d.dim} 维）`, 'ok', 6000);
+        // 两个列表都要刷新：
+        //   refreshVoiceList → 弹窗里的列表（vp-list）
+        //   loadProfiles     → 工具栏的声纹下拉框（#profile）
+        // 早期只调了前者，导致注册成功后下拉框仍是旧的，
+        // 用户看到的现象就是「列表里没有新声纹」。
         await refreshVoiceList();
+        await loadProfiles();
         await refreshUvrStatus();
+        // 自动选中新注册的声纹，省得用户再去找
+        if ($('profile')) {
+          $('profile').value = d.name;
+          $('status-profile').textContent = `声纹：${d.name}`;
+        }
       } catch (e) {
         toast('注册失败：' + e.message, 'error', 10000);
       }
@@ -2019,7 +2030,13 @@ async function importDryVoice() {
       if (!d.ok) { toast('导入失败：' + (d.error || ''), 'error', 10000); return; }
       toast(`已从干声导入声纹「${d.name}」（${d.seconds}s，${d.dim} 维）`,
             'ok', 6000);
+      // 同「按区间注册」：两个列表都要刷新（弹窗 + 工具栏下拉框）
       await refreshVoiceList();
+      await loadProfiles();
+      if ($('profile')) {
+        $('profile').value = d.name;
+        $('status-profile').textContent = `声纹：${d.name}`;
+      }
     } catch (e) {
       toast('导入失败：' + e.message, 'error', 10000);
     }

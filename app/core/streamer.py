@@ -131,6 +131,15 @@ def _get_ecapa(device: str):
     with _LOCK:
         if device in _ECAPA:
             return _ECAPA[device]
+    # Windows 兼容补丁：speechbrain 的 LazyModule 用 "/inspect.py" 判断
+    # 调用栈来源，Windows 路径是反斜杠 → 防护失效 → 递归 RecursionError。
+    # 详见 core/sb_compat.py。
+    try:
+        from . import sb_compat
+
+        sb_compat.apply_patch()
+    except Exception:
+        pass
     try:
         from speechbrain.inference.speaker import EncoderClassifier
     except ImportError:

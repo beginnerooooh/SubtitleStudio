@@ -957,11 +957,18 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send_json(
                         {"ok": False, "error": f"{label}文件不存在：{p}"}, 400)
             engine = VoiceprintEngine(device=body.get("device", "cuda"))
-            prof = StreamerProfile(name=name, speak=engine.enroll(speak, 0.0, 1e9))
+            # enroll() 的时间参数是**秒**，内部 _cap 会按文件时长裁剪。
+            # 传 1e9 会被当成 5e8 秒算出越界区间并抛「无效音频区间」
+            # （实测踩坑）。这里取 WAV 的实际时长。
+            prof = StreamerProfile(
+                name=name, speak=engine.enroll(speak, 0.0,
+                                               _wav_seconds(speak)))
             if body.get("sing_wav"):
-                prof.sing = engine.enroll(body["sing_wav"], 0.0, 1e9)
+                sing = body["sing_wav"]
+                prof.sing = engine.enroll(sing, 0.0, _wav_seconds(sing))
             path_saved = save_profile(prof, profiles_dir=str(ROOT / "profiles"))
-            return self._send_json({"ok": True, "path": str(path_saved)})
+            return self._send_json({"ok": True, "path": str(path_saved),
+                                    "name": name})
         return self._send_error_json("未知接口：" + path, 404)
 
     # ---------- UVR5（人声分离 / 区间声纹注册） ----------

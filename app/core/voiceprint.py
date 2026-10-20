@@ -116,6 +116,16 @@ def merge_regions(
 
 def _load_ecapa(device: str):
     """加载 ECAPA-TDNN（首次调用下载模型，~80MB）。"""
+    # 必须先打 Windows 兼容补丁：speechbrain 的 LazyModule 用
+    # `filename.endswith("/inspect.py")` 判断是否来自 inspect，
+    # 但 Windows 路径用反斜杠，防护永远失效 → 深层递归 RecursionError。
+    # 详见 core/sb_compat.py。
+    try:
+        from . import sb_compat
+
+        sb_compat.apply_patch()
+    except Exception:
+        pass
     try:
         from speechbrain.inference.speaker import EncoderClassifier  # speechbrain >= 1.0
     except ImportError:
