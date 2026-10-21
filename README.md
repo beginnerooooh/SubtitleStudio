@@ -316,7 +316,7 @@ python launcher.py --debug  # 保留控制台与 DEBUG 日志
 ---
 
 ## 命令行
-
+## 进阶命令行（tools/cli.py）
 ```bash
 # 生成字幕
 python tools/cli.py generate <video> [--ref <srt>] [--chunk 120] [--engine whisper]
@@ -331,6 +331,9 @@ python tools/cli.py batch <dir>
 python tools/cli.py info
 ```
 
+
+日常「只想快点拿到字幕」请用下面那节介绍的 `tools/studio_cli.py`
+（带配置文件与逐项参数说明）。
 ---
 
 ## 后端 API
@@ -444,40 +447,63 @@ python app/desktop_server.py
 
 ---
 
-## 人声分离与声纹注册（UVR5）
+## 声纹注册
 
-本地装了 UVR5（Ultimate Vocal Remover 5）时可直接复用它的模型做
-**区间人声分离**，用于声纹注册：
+声纹用于把主播人声与 BGM/其他人分开。**需要一段干净的人声**。
 
-三种注册方式任选：
+推荐流程：先用 [UVR5](https://github.com/Anjok07/ultimatevocalremovergui)
+或类似工具把素材分离成干声，再在「声纹注册」里导入：
 
-1. 在时间轴上**框选**一段主播单独说话/清唱的区间
-2. 在左栏**手动输入**起止时间（支持 `690`、`11:30`、`00:11:30`、`00:11:30:15`）
-3. **直接导入**已经分离好的干声文件（wav/mp3/flac/m4a…，自动转 16kHz）
+- **导入干声（推荐）**：wav / mp3 / flac / m4a / aac / ogg，
+  自动转 16kHz 单声道
+- **按区间切取**：从视频里取一段（仅适用于素材本身人声清晰的片段）
 
-流程：
-点「注册」→ UVR5 的 MDX 模型分离出人声（去掉 BGM）→ 重采样到 16kHz
-→ 提取 192 维声纹 → 保存
+CLI 也可注册：
 
-实测：20 秒区间全程约 20 秒（含分离+提取）。
+`ash
+python tools/studio_cli.py --voiceprint-enroll 干声.wav --voiceprint-name 主播
+`
 
-**为什么自己实现而不调用 UVR5 本体**：UVR5 是 PyInstaller 打包的
-单体程序，只能用图形界面，无法命令行调用。但它下载的模型是标准
-ONNX 权重，可以直接加载——这样还能按需只分离选中的小段，
-比 UVR5 GUI 的整文件处理更贴合「时间轴挑一段」的用法。
+> **为什么不自带人声分离**：早期集成过 UVR5 的 MDX 模型，但实际调用
+> 不稳定（不同机器的模型版本/依赖差异导致推理失败），维护成本高于
+> 收益。UVR5 的分离质量更好，且用户能亲眼确认分离结果是否干净。
+> 因此改为「UVR 分离 → 本工具导入」，职责更单一也更可靠。
+## 命令行版（CLI）
 
-**实现要点（都踩过坑）**
+不想开界面时，用 CLI 一条命令出字幕：
 
-| 现象 | 根因 | 正确做法 |
-|---|---|---|
-| Got invalid dimensions ... Expected: 3072 | 按 n_fft=2048 算出 1025 频点 | 从 session.get_inputs() 读实际形状（3072 频点 = n_fft 6144） |
-| 分离结果近乎静音、频谱重心 13kHz | 多算一步「掩码 = \|out\|/\|in\|」 | MDX 是「谱到谱」映射，输出即人声谱 |
-| 只有首尾几百毫秒有声音 | 分块重叠区直接赋值，未覆盖帧保持全零 | 幅度累加取平均 + 沿用原谱相位 |
-| 声纹引擎报「无效音频区间」 | `enroll()` 的时间参数是秒，传 `1e9` 会被 `_cap` 判为越界 | 先取 WAV 实际时长再传 |
-| `RecursionError: maximum recursion depth exceeded` | speechbrain 的 `LazyModule` 用 `filename.endswith("/inspect.py")` 判断调用栈来源，**Windows 路径是反斜杠**，防护永远失效 → 无限递归 | `core/sb_compat.py` 运行时打补丁，改用 `os.path.basename` 判断 |
-| 声纹引擎报「必须 16000Hz」 | MDX 要 44.1kHz | 分离后再重采样到 16kHz |
+`ash
+# 最简单
+python tools/studio_cli.py 录制.flv
 
-未安装 UVR5 时自动退化为直接用原音频注册（不报错）。
+# 指定目录与格式（srt/ass 可直接拖进剪映、Premiere、DaVinci）
+python tools/studio_cli.py 录制.flv -o ./subs --format srt,ass
+
+# 用配置文件
+python tools/studio_cli.py 录制.flv --config my.toml
+
+# 只处理前 10 分钟做验证
+python tools/studio_cli.py 录制.flv --start 0 --duration 600
+`
+
+配套文件：
+
+| 文件 | 说明 |
+|---|---|
+| 	ools/studio_cli.py | CLI 主程序 |
+| config.example.toml | 配置模板（每项都有注释）|
+| docs/CLI.md | **参数详解文档**（逐项说明默认值与取舍）|
+
+常用辅助命令：
+
+`ash
+python tools/studio_cli.py --init-config my.toml   # 生成配置模板
+python tools/studio_cli.py --print-config --config my.toml  # 看生效参数
+python tools/studio_cli.py --info                  # 看环境（GPU/FFmpeg/声纹）
+`
+
+设计取向：**默认值即最佳实践**。实测过的参数（如 chunk=120、
+eam=1）已经设成默认，用户不需要调参就能得到好结果。
 
 ## 性能
 

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Subtitle Studio 桌面版渲染层。
  *
  * 交互参考剪映等主流剪辑软件：
@@ -1875,26 +1875,11 @@ async function importKeywords() {
   }
 }
 
-// ---------------- 声纹注册（UVR5 分离） ----------------
-
-/** 查询 UVR5 可用性并显示在左栏。 */
-async function refreshUvrStatus() {
-  const el = $('uvr-status');
-  if (!el) return;
-  try {
-    const d = await apiJson('/api/uvr/status', 'GET', undefined, { silent: true });
-    if (d.available) {
-      el.textContent = `可用 · ${d.preferred || '有模型'}`;
-      el.style.color = 'var(--ok, #4ec97a)';
-    } else {
-      el.textContent = '不可用（将直接用原音频）';
-      el.style.color = 'var(--muted)';
-      el.title = d.reason || '';
-    }
-  } catch (e) {
-    el.textContent = '检测失败';
-  }
-}
+// ---------------- 声纹注册（导入干声 / 按区间切取） ----------------
+//
+// 说明：早期这里集成了 UVR5 的 MDX 模型做内置人声分离，但实际调用
+// 不稳定（模型版本/依赖差异），已移除。现在改为「用户先用 UVR5 分离
+// 出干声，再导入」——职责更单一，也更可靠。
 
 /** 把当前框选/选中的时间范围填到起止输入框。 */
 function useSelectionAsSpan() {
@@ -1968,25 +1953,21 @@ function readSpanInputs() {
   return { start: a, end: b };
 }
 
-/** 用输入框区间注册声纹（走 UVR5 分离 → 提取 → 保存）。 */
+/** 用输入框区间从视频切取并注册声纹。 */
 async function enrollVoiceprintFromSpan() {
   const span = readSpanInputs();
   if (!span) return;
   const name = ($('uvr-name').value || '').trim();
   if (!name) { toast('请填写声纹名称', 'warn'); return; }
   if (!S.project || !S.project.meta.video) { toast('请先打开视频', 'warn'); return; }
-  const useUvr = $('uvr-use').checked;
-  const secs = span.end - span.start;
-  await runBlocking('正在注册声纹',
-                    useUvr ? 'UVR5 分离人声…（20 秒音频约需 20 秒）' : '提取声纹…',
+  await runBlocking('正在注册声纹', '切取区间并提取声纹…',
                     async () => {
       try {
-        const d = await apiJson('/api/uvr/enroll', 'POST', {
+        const d = await apiJson('/api/voiceprint/enroll', 'POST', {
           name,
           input: S.project.meta.video,
           start: span.start,
           end: span.end,
-          use_uvr: useUvr,
         }, { silent: true });
         if (!d.ok) { toast('注册失败：' + (d.error || ''), 'error', 10000); return; }
         toast(`已注册声纹「${d.name}」（${d.seconds}s，${d.dim} 维）`, 'ok', 6000);
@@ -1997,12 +1978,9 @@ async function enrollVoiceprintFromSpan() {
         // 用户看到的现象就是「列表里没有新声纹」。
         await refreshVoiceList();
         await loadProfiles();
-        await refreshUvrStatus();
         // 自动选中新注册的声纹，省得用户再去找
-        if ($('profile')) {
-          $('profile').value = d.name;
-          $('status-profile').textContent = `声纹：${d.name}`;
-        }
+        if ($('profile')) $('profile').value = d.name;
+        setSaveState(`声纹：${d.name}`, 'ok');
       } catch (e) {
         toast('注册失败：' + e.message, 'error', 10000);
       }
@@ -2024,8 +2002,8 @@ async function importDryVoice() {
   $('uvr-dry-info').textContent = path.split(/[\\/]/).pop();
   await runBlocking('正在导入干声', '转换采样率并提取声纹…', async () => {
     try {
-      const d = await apiJson('/api/uvr/enroll', 'POST', {
-        name, input: path, start: 0, end: 0, use_uvr: false, whole: true,
+      const d = await apiJson('/api/voiceprint/enroll', 'POST', {
+        name, input: path, start: 0, end: 0, whole: true,
       }, { silent: true });
       if (!d.ok) { toast('导入失败：' + (d.error || ''), 'error', 10000); return; }
       toast(`已从干声导入声纹「${d.name}」（${d.seconds}s，${d.dim} 维）`,
@@ -2033,10 +2011,8 @@ async function importDryVoice() {
       // 同「按区间注册」：两个列表都要刷新（弹窗 + 工具栏下拉框）
       await refreshVoiceList();
       await loadProfiles();
-      if ($('profile')) {
-        $('profile').value = d.name;
-        $('status-profile').textContent = `声纹：${d.name}`;
-      }
+      if ($('profile')) $('profile').value = d.name;
+      setSaveState(`声纹：${d.name}`, 'ok');
     } catch (e) {
       toast('导入失败：' + e.message, 'error', 10000);
     }
@@ -2507,7 +2483,6 @@ function onMarquee(e) {
   const t0 = Math.min(xToTime(m.originX), xToTime(curX));
   const t1 = Math.max(xToTime(m.originX), xToTime(curX));
   // 记录框选的时间区间：供「声纹注册」按区间取用
-  // （UVR5 只需分离这一小段，不必处理整片）
   if (t1 - t0 >= 1.0) S.marqueeRange = { start: Math.max(0, t0), end: t1 };
   const subTop = subOffset;
   const subBottom = subTop + m.subRect.height;
@@ -2741,12 +2716,11 @@ function bindEvents() {
   $('vp-speak-drop').onclick = () => pickVoiceSample('speak');
   $('vp-sing-drop').onclick = () => pickVoiceSample('sing');
 
-  // 声纹注册（UVR5）
+  // 声纹注册（导入干声 / 按区间切取）
   $('uvr-use-selection').onclick = useSelectionAsSpan;
   $('uvr-use-fill').onclick = fillStartFromPlayhead;
   $('uvr-enroll').onclick = enrollVoiceprintFromSpan;
   $('uvr-import').onclick = importDryVoice;
-  refreshUvrStatus();
 
   // 歌词库
   $('btn-lyrics').onclick = openLyrics;

@@ -1,0 +1,133 @@
+# Subtitle Studio CLI 配置文件
+# ============================
+#
+# 用法：
+#   subtitle-studio --config config.toml video.mp4
+#   subtitle-studio video.mp4 -o ./out --format srt,ass
+#
+# 优先级（后者覆盖前者）：
+#   内置默认值  <  本配置文件  <  命令行参数
+#
+# 只写需要改的项即可，未写的沿用默认值。
+
+[general]
+# 输出目录：字幕与报告写到这里
+output_dir = "outputs"
+
+# 设备：auto（自动）/ cuda / cpu
+# auto 会优先用 GPU，显存不足时自动回退
+device = "auto"
+
+# 计算精度：留空自动选择；可填 int8_float16（显存省、速度快）
+# 显存 4GB 级别建议 int8_float16
+compute_type = ""
+
+# 是否覆盖已存在的同名输出文件
+overwrite = true
+
+# 输出文件名（不含扩展名）；留空则用输入文件名
+name = ""
+
+[asr]
+# 识别引擎：whisper（本地，通用） / funasr（中文优化）
+engine = "whisper"
+
+# 模型：large-v3（最准，需 4GB+ 显存） / medium / small
+model = "large-v3"
+
+# 分块长度（秒）。whisper 在长块上会静默跳过内容，
+# 实测 1200 秒时 CER 0.72，120 秒时 0.34，因此默认 120。
+# 显存紧张可降到 60；不要超过 300。
+chunk_seconds = 120
+
+# 相邻分块的重叠（秒）。用于跨块句子不被截断。
+# 实测 10 秒比 30 秒更准且更快（CER 0.340 vs 0.348）。
+chunk_overlap = 10
+
+# 束搜索宽度。1 = 贪心解码。
+# 实测在长音频直播上 beam=1 又快又准（所有指标都优于 beam=5），
+# 因为大 beam 更容易陷入重复循环与幻听。一般不要改。
+beam_size = 1
+
+# 语言：auto / zh / en / ja …
+language = "auto"
+
+# 热词：引导模型输出这些写法（空格分隔）
+# 适合主播昵称、术语。也可用关键词字库（见 [keywords]）
+hotwords = ""
+
+# VAD 语音活动检测。**默认关闭**：
+# Silero VAD 会吞掉歌声与轻声起音，导致整段漏识别。
+# 只有素材里有大量纯静音时才建议开启。
+vad_filter = false
+
+[segment]
+# 断句目标长度（字）。11 字接近真人字幕的呼吸节奏
+target_chars = 11
+
+# 单行最大字数，超过强制断开
+max_chars = 17
+
+# 单行最长时长（秒）
+max_duration = 8.5
+
+# 是否用标点辅助断句（会加载标点模型，首次需下载）
+use_punctuation = true
+
+# 一行内是否需要空格分隔（同一句被断成两段时用空格）
+inner_space = true
+
+[timing]
+# 是否做时间轴整体校正（互相关估计系统性偏移）
+# 关闭可省 1~2 秒，但长时间录音容易整体偏早/偏晚
+refine = true
+
+[song]
+# 是否做歌曲识别与歌词对齐
+enabled = false
+
+# 手动录入本场演唱的曲目（逗号分隔）。
+# 给出后只识别这些歌，可显著减少 BGM 误判。
+manual_titles = ""
+
+# 是否用歌词库校正识别文本
+lyric_correct = false
+
+# 歌词库目录（存放 .lrc/.txt/.srt）
+lyric_library_dir = "lyrics"
+
+# 歌词文档匹配阈值：越高越保守
+lyric_doc_threshold = 0.55
+
+# 单行替换阈值：越高越保守（只替换高度相似的句子）
+lyric_line_threshold = 0.75
+
+[voiceprint]
+# 是否启用主播声纹过滤（需先注册声纹）
+enabled = false
+
+# 声纹名称（profiles/ 下的文件名，不含 .npy）
+profile_name = ""
+
+# 相似度阈值：低于此值判为非主播
+threshold = 0.45
+
+# BGM 处理策略：
+#   mark   = 只标注，不删除（默认，安全）
+#   filter = 直接剔除（激进，可能误删）
+#   off    = 完全不处理
+bgm_policy = "mark"
+
+# BGM 判定阈值（多因子综合分）
+bgm_threshold = 0.35
+
+[keywords]
+# 关键词字库目录（供识别提示 + 生成后纠正）
+dir = "keywords"
+
+[output]
+# 导出格式（逗号分隔）：srt / ass / vtt / lrc / json
+formats = "srt"
+
+# 是否同时导出评测报告（需提供 --reference）
+report = false

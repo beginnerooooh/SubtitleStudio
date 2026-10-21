@@ -330,7 +330,9 @@ audio/video input
 
 ---
 
-## Command Line
+## Advanced CLI (`tools/cli.py`)
+
+A lower-level CLI for batch jobs and evaluation pipelines:
 
 ```bash
 # Generate subtitles
@@ -345,6 +347,9 @@ python tools/cli.py batch <dir>
 # Environment and defaults
 python tools/cli.py info
 ```
+
+For everyday "just give me subtitles" use, see **Command Line** below
+(`tools/studio_cli.py`) — it has a config file and annotated parameters.
 
 ---
 
@@ -460,38 +465,61 @@ Conventions:
 
 ---
 
-## Vocal Separation & Voiceprint Enrollment (UVR5)
+## Voiceprint Enrollment
 
-When UVR5 (Ultimate Vocal Remover 5) is installed locally, its models can be
-reused for **segment-level vocal separation** before voiceprint enrollment:
+Voiceprints separate the streamer's voice from BGM and other speakers.
+Enrollment needs a **clean vocal sample**.
 
-Three ways to enroll:
+Recommended workflow: first separate the source with
+[UVR5](https://github.com/Anjok07/ultimatevocalremovergui) (or similar),
+then import the dry vocal here:
 
-1. **Drag-select** a segment where the streamer talks or sings alone
-2. **Type the range** in the left panel (`690`, `11:30`, `00:11:30`, `00:11:30:15`)
-3. **Import a dry vocal file** (wav/mp3/flac/m4a… — converted to 16 kHz automatically)
-Click "enroll" → the UVR5 MDX model extracts the vocal (removing BGM) →
-resample to 16 kHz → extract a 192-dim embedding → save
+- **Import dry vocal (recommended)** — wav / mp3 / flac / m4a / aac / ogg,
+  converted to 16 kHz mono automatically
+- **Cut a range** — take a segment from the video (only suitable when the
+  source already has clean vocals)
 
-Measured: a 20-second segment takes about 20 seconds end to end.
+From the CLI:
 
-**Why reimplement instead of calling UVR5 itself**: UVR5 ships as a PyInstaller
-single-file bundle driven only by a GUI — no CLI. Its downloaded models are plain
-ONNX weights, though, so they can be loaded directly. That also lets us separate
-*only the selected segment* rather than the whole file.
+`ash
+python tools/studio_cli.py --voiceprint-enroll vocal.wav --voiceprint-name host
+`
 
-**Implementation notes (all learned the hard way)**
+> **Why no built-in separation**: an earlier version embedded UVR5's MDX
+> model, but it proved unreliable across machines (model/dependency
+> differences caused inference failures) and the maintenance cost outweighed
+> the benefit. UVR5 separates better and lets you confirm the result is
+> clean. The tool now only does "dry vocal → voiceprint", which is narrower
+> and more dependable.
 
-| Symptom | Root cause | Fix |
-|---|---|---|
-| Got invalid dimensions ... Expected: 3072 | assumed n_fft=2048 → 1025 bins | read the real shape from session.get_inputs() (3072 bins ⇒ n_fft 6144) |
-| near-silent output, spectral centroid at 13 kHz | applied an extra mask = |out|/|in| | MDX is spectrum-to-spectrum; its output *is* the vocal spectrum |
-| only the first/last few hundred ms audible | overlapping blocks assigned directly, uncovered frames stayed zero | accumulate magnitudes and average, reuse the original phase |
-| "must be 16000 Hz" from the voiceprint engine | MDX requires 44.1 kHz | resample to 16 kHz after separation |
-| `RecursionError: maximum recursion depth exceeded` | speechbrain's `LazyModule` checks `filename.endswith("/inspect.py")` — but Windows paths use backslashes, so the guard never fires and recursion runs away | `core/sb_compat.py` patches it at runtime to use `os.path.basename` |
+## Command Line
 
-Without UVR5 it degrades gracefully to enrolling from the raw audio.
+For scripted or headless use:
 
+`ash
+python tools/studio_cli.py 录制.flv                      # simplest
+python tools/studio_cli.py 录制.flv -o ./subs --format srt,ass
+python tools/studio_cli.py 录制.flv --config my.toml
+python tools/studio_cli.py 录制.flv --start 0 --duration 600
+`
+
+| File | Purpose |
+|---|---|
+| 	ools/studio_cli.py | CLI entry point |
+| config.example.toml | Config template (every option annotated) |
+| docs/CLI.md | **Full parameter reference** (defaults and tradeoffs) |
+
+Helper commands:
+
+`ash
+python tools/studio_cli.py --init-config my.toml   # write a template
+python tools/studio_cli.py --print-config --config my.toml  # effective values
+python tools/studio_cli.py --info                  # environment info
+`
+
+Design stance: **the defaults are the best practice**. Parameters validated
+by measurement (chunk=120, eam=1, …) are already the defaults, so you
+get good results without tuning.
 ## Performance
 
 Measured on a 72-minute 1080p60 livestream recording (RTX 3050 Laptop, 4 GB):

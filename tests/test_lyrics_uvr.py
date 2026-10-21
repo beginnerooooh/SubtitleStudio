@@ -1,4 +1,4 @@
-"""歌词局部匹配、UVR5 集成、时间轴拖动回归测试。
+﻿"""歌词局部匹配、声纹注册、时间轴拖动回归测试。
 
 这些测试针对**真实数据**上暴露的问题，每个都写清了失败现象，
 避免以后重构时把它们改回去。
@@ -126,74 +126,6 @@ def test_chorus_repetition_allowed():
     rep = match_document(subs, doc, threshold=0.5)
     # 至少能匹配到两处不同位置
     assert len(rep.matches) >= 2, f"副歌重复应能多处匹配，实际 {len(rep.matches)}"
-
-
-# ---------------- UVR5 ----------------
-
-def test_uvr_detects_installed_root():
-    """UVR5 探测：找不到时应返回 None 而不是抛错。"""
-    from core import uvr5
-
-    root = uvr5.detect_uvr_root()
-    if root:
-        assert Path(root, "models").is_dir()
-    else:
-        assert root is None
-
-
-def test_uvr_status_shape():
-    """状态对象字段齐全（UI 依赖这些字段）。"""
-    from core import uvr5
-
-    st = uvr5.status()
-    d = st.to_dict()
-    for key in ("available", "root", "models", "preferred", "reason"):
-        assert key in d
-    if d["available"]:
-        assert d["preferred"], "可用时必须给出首选模型"
-        assert d["models"], "可用时必须列出模型"
-
-
-def test_uvr_model_shape_is_respected():
-    """回归：MDX 模型的输入维度必须按实际形状读取。
-
-    实测踩坑：按 n_fft=2048 实现会得到 1025 个频点，而模型要求 3072，
-    报 `Got invalid dimensions ... Expected: 3072`。
-    """
-    from core import uvr5
-
-    root = uvr5.detect_uvr_root()
-    if not root:
-        pytest.skip("未安装 UVR5")
-    model = uvr5.pick_vocal_model(root)
-    if model is None:
-        pytest.skip("UVR5 目录里没有模型")
-    src = (ROOT / "app" / "core" / "uvr5.py").read_text(encoding="utf-8")
-    # 必须从模型实际形状推导，而不是写死
-    assert "get_inputs()" in src
-    assert "n_freq" in src and "n_fft" in src
-    # 必须记录踩坑经验
-    assert "3072" in src
-
-
-def test_uvr_separation_accumulates_overlap():
-    """回归：分块重叠区必须取平均，不能直接赋值。
-
-    实测踩坑：直接赋值会让未覆盖的帧保持全零，重建后「只有首尾有声音」；
-    而复相加会在重叠区因相位不一致相互抵消，同样导致大片静音。
-    正确做法是「幅度累加取平均 + 沿用原相位」。
-    """
-    src = (ROOT / "app" / "core" / "uvr5.py").read_text(encoding="utf-8")
-    assert "mag_acc" in src, "应按幅度累加"
-    assert "wsum" in src, "应统计权重以便取平均"
-    assert "np.angle" in src, "应沿用原谱相位"
-
-
-def test_uvr_output_is_voiceprint_compatible():
-    """回归：分离结果必须能直接喂给声纹引擎（16kHz 单声道）。"""
-    src = (ROOT / "app" / "core" / "uvr5.py").read_text(encoding="utf-8")
-    assert "separate_segment_for_voiceprint" in src
-    assert "16000" in src, "必须重采样到 16kHz"
 
 
 # ---------------- 时间轴拖动 ----------------
@@ -374,7 +306,7 @@ def test_enroll_uses_real_duration_not_huge_number():
 def test_frontend_refreshes_both_voiceprint_lists():
     """回归：注册成功后必须同时刷新「弹窗列表」和「工具栏下拉框」。
 
-    实测事故：UVR 注册成功后只调了 refreshVoiceList()（刷新弹窗的
+    实测事故：声纹注册成功后只调了 refreshVoiceList()（刷新弹窗的
     vp-list），没调 loadProfiles()（刷新 #profile 下拉框），
     用户看到的现象是「注册了但列表里没有新声纹」。
     """
@@ -389,3 +321,138 @@ def test_frontend_refreshes_both_voiceprint_lists():
         assert "refreshVoiceList()" in body, f"{anchor} 缺少 refreshVoiceList()"
         assert "loadProfiles()" in body, (
             f"{anchor} 缺少 loadProfiles()——下拉框不会出现新声纹")
+
+
+# ---------------- CLI ----------------
+
+def _run_cli(*argv, timeout: int = 300):
+    """运行 CLI，返回 (退出码, 标准输出+错误)。"""
+    import subprocess
+
+    # 必须用**当前解释器**（runtime/python.exe），不能用 shutil.which("python")：
+    # 实测该函数会返回 MSYS2 的 python，它没装本项目依赖，
+    # 导致 CLI 在 import 阶段就崩，测试结果完全失真。
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "tools" / "studio_cli.py"), *argv],
+        capture_output=True, encoding="utf-8", errors="replace",
+        timeout=timeout, cwd=str(ROOT))
+    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+
+def test_cli_help_works():
+    """CLI 应能打印帮助并以 0 退出（无输入时打印帮助）。"""
+    rc, out = _run_cli()
+    assert rc == 1, "无输入参数应返回 1"
+    assert "usage" in out.lower()
+
+
+def test_cli_info_works():
+    """--info 应显示环境信息。"""
+    rc, out = _run_cli("--info")
+    assert rc == 0
+    assert "FFmpeg" in out
+    assert "PyTorch" in out or "未安装" in out
+
+
+def test_cli_init_config_generates_template(tmp_path):
+    """--init-config 应生成带注释的配置模板。"""
+    dst = tmp_path / "my.toml"
+    rc, out = _run_cli("--init-config", str(dst))
+    assert rc == 0, out[:500]
+    assert dst.is_file()
+    text = dst.read_text(encoding="utf-8")
+    # 必须有注释说明与关键分节
+    assert "#" in text
+    for section in ("[general]", "[asr]", "[segment]", "[voiceprint]"):
+        assert section in text, f"模板缺少 {section}"
+
+
+def test_cli_init_config_refuses_overwrite(tmp_path):
+    """已存在的配置默认不覆盖，需 --force。"""
+    dst = tmp_path / "my.toml"
+    dst.write_text("x = 1\n", encoding="utf-8")
+    rc, out = _run_cli("--init-config", str(dst))
+    assert rc == 1, "已存在时应拒绝"
+    assert "已存在" in out or "\u5df2\u5b58\u5728" in out
+    # 加 --force 才覆盖
+    rc2, _ = _run_cli("--init-config", str(dst), "--force")
+    assert rc2 == 0
+
+
+def test_cli_print_config_reflects_file(tmp_path):
+    """--print-config 应把配置文件的值合并进最终结果。"""
+    cfg = tmp_path / "c.toml"
+    cfg.write_text(
+        "[asr]\nchunk_seconds = 60\nbeam_size = 3\n\n"
+        "[segment]\nmax_chars = 12\n",
+        encoding="utf-8")
+    rc, out = _run_cli("--print-config", "--config", str(cfg))
+    assert rc == 0, out[:600]
+    assert "asr.chunk_seconds = 60.0" in out
+    assert "asr.beam_size = 3" in out
+    assert "segment.max_chars = 12" in out
+
+
+def test_cli_command_line_overrides_config(tmp_path):
+    """命令行参数优先级最高，应覆盖配置文件。"""
+    cfg = tmp_path / "c.toml"
+    cfg.write_text("[asr]\nchunk_seconds = 60\n", encoding="utf-8")
+    rc, out = _run_cli("--print-config", "--config", str(cfg),
+                       "--chunk", "200")
+    assert rc == 0
+    assert "asr.chunk_seconds = 200.0" in out
+
+
+def test_cli_rejects_missing_input():
+    """输入文件不存在应返回 2。"""
+    rc, out = _run_cli("no_such_file_xyz.mp4")
+    assert rc == 2, out[:400]
+    assert "不存在" in out or "not exist" in out.lower()
+
+
+def test_cli_rejects_bad_format():
+    """不支持的格式应返回 1。"""
+    # 造一个假文件路径（存在性检查在前，所以先用真实文件）
+    sample = ROOT / "outputs" / "_eval" / "burn_src.mp4"
+    if not sample.is_file():
+        pytest.skip("缺少测试视频")
+    rc, out = _run_cli(str(sample), "--format", "docx")
+    assert rc == 1, out[:400]
+    assert "不支持" in out or "unsupported" in out.lower()
+
+
+def test_cli_config_missing_file_errors():
+    """配置文件不存在应明确报错。"""
+    rc, out = _run_cli("--print-config", "--config", "no_such.toml")
+    assert rc != 0
+    assert "不存在" in out
+
+
+def test_cli_has_all_documented_flags():
+    """回归：docs/CLI.md 里提到的每个参数都必须真实存在。
+
+    避免文档与实现脱节（用户照着文档敲却报 unknown argument）。
+    """
+    import re
+
+    rc, out = _run_cli("--help")
+    assert rc == 0 or rc == 1
+    doc = (ROOT / "docs" / "CLI.md").read_text(encoding="utf-8")
+    # 从文档表格里抽出 `--xxx` 形式的参数
+    flags = set(re.findall(r"`(--[a-z][a-z0-9-]+)", doc))
+    assert flags, "文档里没找到参数"
+    missing = [f for f in flags if f not in out]
+    assert not missing, f"文档提到但 CLI 没有的参数: {missing}"
+
+
+def test_cli_documents_config_sections():
+    """配置模板里的每个分节都应在文档里有说明。"""
+    tmpl = (ROOT / "config.example.toml").read_text(encoding="utf-8")
+    doc = (ROOT / "docs" / "CLI.md").read_text(encoding="utf-8")
+    import re
+
+    sections = set(re.findall(r"^\[([a-z]+)\]", tmpl, re.M))
+    assert sections, "模板里没有分节"
+    # 文档至少要提到这些分节名
+    for s in sections:
+        assert s in doc.lower(), f"文档未说明配置分节 [{s}]"
